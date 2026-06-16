@@ -1,0 +1,8 @@
+{
+  "name": "claude-fleet-codex-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@openai/codex-sdk": "^0.130.0"
+  }
+}
