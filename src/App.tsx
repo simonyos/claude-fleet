@@ -1080,7 +1080,13 @@ function RoomTabs({
             <small>{room.agents.length}</small>
           </button>
         ))}
-        <button className="room-tab add-room-tab" onClick={onNewRoom} type="button" title="New room">
+        <button
+          aria-label="New room"
+          className="room-tab add-room-tab"
+          onClick={onNewRoom}
+          type="button"
+          title="New room"
+        >
           +
         </button>
       </div>
@@ -1281,7 +1287,7 @@ function AgentTranscriptChat({ roomId, agent, active }: { roomId: string; agent:
         appInvoke("stop_claude_transcript_watch", { agentId: transcriptKey }).catch(() => {});
       }
     };
-  }, [active, agent.cwd, isClaude, transcriptKey]);
+  }, [active, agent.cwd, agent.sessionId, isClaude, transcriptKey]);
 
   useEffect(() => {
     if (!active) return;

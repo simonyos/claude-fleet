@@ -93,20 +93,45 @@ fn transcript_candidates(cwd: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(candidates)
 }
 
+fn session_transcript_paths(cwd: &Path, session_id: &str) -> Result<Vec<PathBuf>, String> {
+    let root = claude_projects_dir()?;
+    let file_name = format!("{}.jsonl", session_id);
+    let direct_path = root.join(claude_project_dir_name(cwd)).join(&file_name);
+    let mut paths = vec![direct_path.clone()];
+
+    if root.exists() {
+        for project_entry in fs::read_dir(root).map_err(|e| e.to_string())? {
+            let project_path = project_entry.map_err(|e| e.to_string())?.path();
+            if !project_path.is_dir() {
+                continue;
+            }
+
+            let path = project_path.join(&file_name);
+            if path != direct_path && path.exists() {
+                paths.push(path);
+            }
+        }
+    }
+
+    Ok(paths)
+}
+
 fn read_tail(path: &Path, max_bytes: u64) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let len = file.metadata().map_err(|e| e.to_string())?.len();
     let start = len.saturating_sub(max_bytes);
-    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| e.to_string())?;
 
-    let mut text = String::new();
-    file.read_to_string(&mut text).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes);
     if start > 0 {
         if let Some((_, rest)) = text.split_once('\n') {
             return Ok(rest.to_string());
         }
     }
-    Ok(text)
+    Ok(text.into_owned())
 }
 
 fn text_from_content(content: &Value) -> Option<String> {
@@ -148,11 +173,18 @@ fn event_cwd_matches(value: &Value, cwd: &Path) -> bool {
     Path::new(event_cwd) == cwd
 }
 
-fn parse_transcript(path: &Path, cwd: &Path, limit: usize) -> Result<Option<ClaudeTranscript>, String> {
+fn parse_transcript(
+    path: &Path,
+    cwd: &Path,
+    limit: usize,
+) -> Result<Option<ClaudeTranscript>, String> {
     let text = read_tail(path, 768 * 1024)?;
     let mut saw_matching_cwd = false;
     let mut messages = Vec::new();
-    let mut session_id = path.file_stem().and_then(|stem| stem.to_str()).map(ToOwned::to_owned);
+    let mut session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(ToOwned::to_owned);
 
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -163,7 +195,10 @@ fn parse_transcript(path: &Path, cwd: &Path, limit: usize) -> Result<Option<Clau
             saw_matching_cwd = true;
         }
         if session_id.is_none() {
-            session_id = value.get("sessionId").and_then(Value::as_str).map(ToOwned::to_owned);
+            session_id = value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
         }
 
         let event_type = value.get("type").and_then(Value::as_str);
@@ -194,11 +229,19 @@ fn parse_transcript(path: &Path, cwd: &Path, limit: usize) -> Result<Option<Clau
             id,
             role: role.to_string(),
             body,
-            created_at: value.get("timestamp").and_then(Value::as_str).map(ToOwned::to_owned),
+            created_at: value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
         });
     }
 
-    if !saw_matching_cwd && path.parent().map(|parent| parent.ends_with(claude_project_dir_name(cwd))).unwrap_or(false) {
+    if !saw_matching_cwd
+        && path
+            .parent()
+            .map(|parent| parent.ends_with(claude_project_dir_name(cwd)))
+            .unwrap_or(false)
+    {
         saw_matching_cwd = true;
     }
     if !saw_matching_cwd {
@@ -241,11 +284,28 @@ fn read_transcript_for_cwd(cwd: &Path, limit: usize) -> Result<ClaudeTranscript,
     Ok(empty_transcript())
 }
 
-fn read_transcript_for_path(path: &Path, cwd: &Path, limit: usize) -> Result<Option<ClaudeTranscript>, String> {
+fn read_transcript_for_path(
+    path: &Path,
+    cwd: &Path,
+    limit: usize,
+) -> Result<Option<ClaudeTranscript>, String> {
     if !path.exists() {
         return Ok(None);
     }
     parse_transcript(path, cwd, limit)
+}
+
+fn read_transcript_for_session(
+    cwd: &Path,
+    limit: usize,
+    session_id: &str,
+) -> Result<Option<(PathBuf, ClaudeTranscript)>, String> {
+    for path in session_transcript_paths(cwd, session_id)? {
+        if let Some(transcript) = read_transcript_for_path(&path, cwd, limit)? {
+            return Ok(Some((path, transcript)));
+        }
+    }
+    Ok(None)
 }
 
 fn transcript_has_agent_marker(path: &Path, agent_id: &str) -> bool {
@@ -255,7 +315,10 @@ fn transcript_has_agent_marker(path: &Path, agent_id: &str) -> bool {
     text.contains(agent_id) || text.contains(&format!("Consult with {}", agent_id))
 }
 
-fn bindable_transcripts(cwd: &Path, limit: usize) -> Result<Vec<(PathBuf, ClaudeTranscript)>, String> {
+fn bindable_transcripts(
+    cwd: &Path,
+    limit: usize,
+) -> Result<Vec<(PathBuf, ClaudeTranscript)>, String> {
     let mut matches = Vec::new();
     for path in transcript_candidates(cwd)?.into_iter().take(40) {
         if let Some(transcript) = parse_transcript(&path, cwd, limit)? {
@@ -280,8 +343,7 @@ fn read_bound_transcript(
     }
 
     if let Some(session_id) = session_id {
-        let path = claude_projects_dir()?.join(claude_project_dir_name(cwd)).join(format!("{}.jsonl", session_id));
-        if let Some(transcript) = read_transcript_for_path(&path, cwd, limit)? {
+        if let Some((path, transcript)) = read_transcript_for_session(cwd, limit, session_id)? {
             watchers.bindings.lock().insert(agent_id.to_string(), path);
             return Ok(transcript);
         }
@@ -293,7 +355,10 @@ fn read_bound_transcript(
         .iter()
         .find(|(path, _)| transcript_has_agent_marker(path, agent_id))
     {
-        watchers.bindings.lock().insert(agent_id.to_string(), path.clone());
+        watchers
+            .bindings
+            .lock()
+            .insert(agent_id.to_string(), path.clone());
         return Ok(transcript.clone());
     }
 
@@ -347,8 +412,7 @@ pub fn read_claude_transcript(
     let cwd = PathBuf::from(cwd);
     let limit = limit.unwrap_or(80).clamp(1, 200);
     if let Some(session_id) = session_id {
-        let path = claude_projects_dir()?.join(claude_project_dir_name(&cwd)).join(format!("{}.jsonl", session_id));
-        if let Some(transcript) = read_transcript_for_path(&path, &cwd, limit)? {
+        if let Some((path, transcript)) = read_transcript_for_session(&cwd, limit, &session_id)? {
             if let Some(agent_id) = agent_id {
                 watchers.bindings.lock().insert(agent_id, path);
             }
@@ -386,7 +450,13 @@ pub fn watch_claude_transcript(
     std::thread::spawn(move || {
         let mut last_signature = String::new();
         while !stop.load(Ordering::Relaxed) {
-            match read_bound_transcript(&watcher_state, &agent_id, &cwd, limit, session_id.as_deref()) {
+            match read_bound_transcript(
+                &watcher_state,
+                &agent_id,
+                &cwd,
+                limit,
+                session_id.as_deref(),
+            ) {
                 Ok(transcript) => {
                     let signature = transcript_signature(&transcript);
                     if signature != last_signature {
