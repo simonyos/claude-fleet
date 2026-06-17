@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { TerminalPane } from "./components/TerminalPane";
 import { AgentRuntime, runtimeAdapters } from "./runtimeAdapters";
 import "./App.css";
@@ -42,6 +43,30 @@ type MessageRecord = {
   to: string;
   body: string;
   createdAt: string;
+};
+
+type ClaudeTranscriptMessage = {
+  id: string;
+  role: string;
+  body: string;
+  createdAt: string | null;
+};
+
+type ClaudeTranscript = {
+  sessionId: string | null;
+  sessionPath: string | null;
+  updatedAt: string | null;
+  messages: ClaudeTranscriptMessage[];
+};
+
+type ClaudeTranscriptEvent = {
+  agentId: string;
+  transcript: ClaudeTranscript;
+};
+
+type ClaudeTranscriptErrorEvent = {
+  agentId: string;
+  error: string;
 };
 
 type LegacyTaskRecord = {
@@ -219,7 +244,29 @@ async function appInvoke<T>(cmd: string, args?: Record<string, unknown>): Promis
         body: String(args?.body ?? ""),
         createdAt: new Date().toISOString(),
       } as T;
+    case "read_claude_transcript":
+      return {
+        sessionId: "preview-session",
+        sessionPath: "~/.claude/projects/preview/preview-session.jsonl",
+        updatedAt: new Date().toISOString(),
+        messages: [
+          {
+            id: "preview-user",
+            role: "user",
+            body: "Does auth guarantee ordering for account events?",
+            createdAt: new Date(Date.now() - 1000 * 60 * 3).toISOString(),
+          },
+          {
+            id: "preview-assistant",
+            role: "assistant",
+            body: "Auth preserves order per account_id inside one partition. Cross-account events can arrive independently, so consumers should not infer global ordering.",
+            createdAt: new Date(Date.now() - 1000 * 60 * 2).toISOString(),
+          },
+        ],
+      } as T;
     case "write_pty":
+    case "watch_claude_transcript":
+    case "stop_claude_transcript_watch":
     case "plugin:dialog|open":
       return null as T;
     default:
@@ -823,6 +870,7 @@ function ProjectAgentPane({
 }) {
   const paneRef = useRef<HTMLElement | null>(null);
   const [terminalReady, setTerminalReady] = useState(selected || focused);
+  const [paneView, setPaneView] = useState<"chat" | "terminal">("chat");
   const adapter = runtimeAdapters[agent.runtime];
   const context = {
     ...runtimeContext,
@@ -868,30 +916,179 @@ function ProjectAgentPane({
         </button>
         <div className="agent-pane-actions">
           <code>{agent.runtime}</code>
+          <div className="pane-mode-toggle" aria-label={`${agent.label} view`}>
+            <button
+              className={paneView === "chat" ? "is-active" : ""}
+              onClick={() => setPaneView("chat")}
+              type="button"
+            >
+              Chat
+            </button>
+            <button
+              className={paneView === "terminal" ? "is-active" : ""}
+              onClick={() => setPaneView("terminal")}
+              type="button"
+            >
+              Terminal
+            </button>
+          </div>
           <button className="btn" onClick={() => onFocus(agent.id)}>
             {focused ? "Exit focus" : "Focus"}
           </button>
         </div>
       </div>
       <div className="agent-project-path" title={agent.cwd ?? undefined}>{shortPath(agent.cwd)}</div>
-      <div className="agent-terminal-slot">
-        {terminalReady ? (
-          <TerminalPane
-            id={agent.id}
-            cmd={adapter.command}
-            args={adapter.freshArgs(agent.id, context)}
-            continueArgs={adapter.resumeArgs(agent.id, context)}
-            initialUseContinue={shouldResume}
-            onSessionStarted={() => onSessionStarted(agent.id)}
-            cwd={agent.cwd ?? undefined}
-          />
-        ) : (
-          <div className="terminal-standby" aria-label={`${agent.label} terminal standby`}>
-            <span>standby</span>
-          </div>
-        )}
+      <div className="agent-live-slot">
+        <div className={`pane-layer ${paneView === "terminal" ? "is-active" : ""}`} aria-hidden={paneView !== "terminal"}>
+          {terminalReady ? (
+            <TerminalPane
+              id={agent.id}
+              cmd={adapter.command}
+              args={adapter.freshArgs(agent.id, context)}
+              continueArgs={adapter.resumeArgs(agent.id, context)}
+              initialUseContinue={shouldResume}
+              onSessionStarted={() => onSessionStarted(agent.id)}
+              cwd={agent.cwd ?? undefined}
+            />
+          ) : (
+            <div className="terminal-standby" aria-label={`${agent.label} terminal standby`}>
+              <span>standby</span>
+            </div>
+          )}
+        </div>
+        <div className={`pane-layer ${paneView === "chat" ? "is-active" : ""}`} aria-hidden={paneView !== "chat"}>
+          <AgentTranscriptChat agent={agent} active={paneView === "chat"} />
+        </div>
       </div>
     </article>
+  );
+}
+
+function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: boolean }) {
+  const [transcript, setTranscript] = useState<ClaudeTranscript | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const isClaude = agent.runtime === "claude";
+
+  useEffect(() => {
+    if (!active || !agent.cwd || !isClaude) return;
+    let cancelled = false;
+    let unlistenTranscript: UnlistenFn | undefined;
+    let unlistenError: UnlistenFn | undefined;
+
+    appInvoke<ClaudeTranscript>("read_claude_transcript", { cwd: agent.cwd, limit: 80 })
+      .then((nextTranscript) => {
+        if (cancelled) return;
+        setTranscript(nextTranscript);
+        setError(null);
+      })
+      .catch((loadError) => {
+        if (cancelled) return;
+        setError(String(loadError));
+      });
+
+    if (hasTauriBridge()) {
+      listen<ClaudeTranscriptEvent>(`claude:transcript:${agent.id}`, (event) => {
+        if (cancelled) return;
+        setTranscript(event.payload.transcript);
+        setError(null);
+      }).then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenTranscript = unlisten;
+      });
+
+      listen<ClaudeTranscriptErrorEvent>(`claude:transcript-error:${agent.id}`, (event) => {
+        if (cancelled) return;
+        setError(event.payload.error);
+      }).then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenError = unlisten;
+      });
+
+      appInvoke("watch_claude_transcript", { agentId: agent.id, cwd: agent.cwd, limit: 80 }).catch((watchError) => {
+        if (!cancelled) setError(String(watchError));
+      });
+    }
+
+    return () => {
+      cancelled = true;
+      unlistenTranscript?.();
+      unlistenError?.();
+      if (hasTauriBridge()) {
+        appInvoke("stop_claude_transcript_watch", { agentId: agent.id }).catch(() => {});
+      }
+    };
+  }, [active, agent.cwd, agent.id, isClaude]);
+
+  useEffect(() => {
+    if (!active) return;
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    scroller.scrollTop = scroller.scrollHeight;
+  }, [active, transcript?.messages.length]);
+
+  if (!agent.cwd) {
+    return (
+      <div className="chat-empty-state">
+        <strong>No project path</strong>
+        <span>Add a project path to read this agent's Claude session as chat.</span>
+      </div>
+    );
+  }
+
+  if (!isClaude) {
+    return (
+      <div className="chat-empty-state">
+        <strong>Chat transcript unavailable</strong>
+        <span>Codex panes still run in terminal mode. Claude JSONL chat is available for Claude agents.</span>
+      </div>
+    );
+  }
+
+  const messages = transcript?.messages ?? [];
+
+  return (
+    <section className="agent-chat" aria-label={`${agent.label} Claude transcript`}>
+      <header className="agent-chat-header">
+        <div>
+          <strong>Chat</strong>
+          <span title={transcript?.sessionPath ?? undefined}>
+            {transcript?.sessionId ? `session ${transcript.sessionId.slice(0, 8)}` : "waiting for Claude session"}
+          </span>
+        </div>
+        <code>{messages.length}</code>
+      </header>
+
+      <div ref={scrollerRef} className="chat-scroll">
+        {messages.map((message) => (
+          <article className={`chat-message is-${message.role}`} key={message.id}>
+            <div className="chat-message-meta">
+              <span>{message.role === "assistant" ? agent.label : "you"}</span>
+              {message.createdAt ? <time>{formatTime(message.createdAt)}</time> : null}
+            </div>
+            <p>{message.body}</p>
+          </article>
+        ))}
+        {messages.length === 0 && !error ? (
+          <div className="chat-empty-state">
+            <strong>No transcript yet</strong>
+            <span>Claude will appear here after this project has an active session in ~/.claude/projects.</span>
+          </div>
+        ) : null}
+        {error ? (
+          <div className="chat-empty-state is-error">
+            <strong>Could not read transcript</strong>
+            <span>{error}</span>
+          </div>
+        ) : null}
+      </div>
+    </section>
   );
 }
 
