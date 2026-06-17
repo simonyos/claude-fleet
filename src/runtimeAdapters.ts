@@ -39,7 +39,7 @@ export const runtimeAdapters: Record<AgentRuntime, RuntimeAdapter> = {
       context.mcpConfigPath,
     ],
     resumeArgs: (agentId, context, sessionId) => [
-      ...(sessionId ? ["--resume", sessionId] : ["--continue"]),
+      ...(sessionId ? ["--session-id", sessionId] : ["--continue"]),
       "--append-system-prompt",
       context.systemPrompt(agentId),
       "--mcp-config",
