@@ -128,8 +128,13 @@ const agentColors = [
 
 const encode = (data: string) => Array.from(new TextEncoder().encode(data));
 const defaultAgentColor = (index: number) => agentColors[index % agentColors.length];
-const sessionMarker = (agentId: string) => `agent-home-v1:${agentId}:${Date.now()}`;
 const hasTauriBridge = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const createSessionId = () =>
+  globalThis.crypto?.randomUUID?.() ??
+  "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (char) =>
+    (Number(char) ^ (Math.random() * 16) >> (Number(char) / 4)).toString(16),
+  );
 
 const nextId = (prefix: string, existingIds: string[]) => {
   let n = existingIds.length + 1;
@@ -299,9 +304,7 @@ async function appInvoke<T>(cmd: string, args?: Record<string, unknown>): Promis
 }
 
 const hasUsableSession = (agent: AgentRecord) => {
-  if (!agent.sessionId) return false;
-  if (agent.runtime === "codex") return agent.sessionId.startsWith("agent-home-v1:");
-  return true;
+  return Boolean(agent.sessionId && agent.status === "session-started");
 };
 
 const systemPromptFor = (agent: AgentRecord, agents: AgentRecord[]) => {
@@ -368,7 +371,7 @@ function createAgent({
     runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
     permissions: { canCreateAgents: false, canManageTasks: false },
     sourceTaskId: null,
-    sessionId: null,
+    sessionId: createSessionId(),
     status: "idle",
   };
 }
@@ -658,11 +661,13 @@ function App() {
     setFleetState((current) => {
       if (!current) return current;
       const existing = current.agents.find((agent) => agent.id === id);
-      if (!existing || existing.sessionId) return current;
+      if (!existing || existing.status === "session-started") return current;
       const normalized = persistActiveRoom(normalizeLoadedState({
         ...current,
         agents: current.agents.map((agent) =>
-          agent.id === id ? { ...agent, sessionId: sessionMarker(id) } : agent,
+          agent.id === id
+            ? { ...agent, sessionId: agent.sessionId ?? createSessionId(), status: "session-started" }
+            : agent,
         ),
       }), selectedAgentId);
       appInvoke("save_fleet_state", { state: normalized }).catch((error) =>
@@ -772,6 +777,7 @@ function App() {
               {fleetState.agents.map((agent) => (
                 <ProjectAgentPane
                   key={`${fleetState.activeRoomId ?? "room"}:${agent.id}`}
+                  roomId={fleetState.activeRoomId ?? fleetState.activeWorkspace?.id ?? "room"}
                   agent={agent}
                   selected={agent.id === selectedAgent?.id}
                   focused={isFocusMode && agent.id === selectedAgent?.id}
@@ -923,11 +929,8 @@ function normalizeAgents(agents: AgentRecord[], workspacePath: string | null): A
       runtimeConfig: agent.runtimeConfig ?? { heartbeat: { enabled: false, wakeOnDemand: true } },
       permissions: { canCreateAgents: false, canManageTasks: false },
       sourceTaskId: null,
-      sessionId:
-        agent.runtime === "codex" && agent.sessionId && !agent.sessionId.startsWith("agent-home-v1:")
-          ? null
-          : agent.sessionId ?? null,
-      status: agent.status || "idle",
+      sessionId: agent.sessionId && sessionIdPattern.test(agent.sessionId) ? agent.sessionId : createSessionId(),
+      status: agent.sessionId && sessionIdPattern.test(agent.sessionId) ? agent.status || "idle" : "idle",
     };
   });
 }
@@ -1086,6 +1089,7 @@ function RoomTabs({
 }
 
 function ProjectAgentPane({
+  roomId,
   agent,
   selected,
   focused,
@@ -1096,6 +1100,7 @@ function ProjectAgentPane({
   onFocus,
   onSessionStarted,
 }: {
+  roomId: string;
   agent: AgentRecord;
   selected: boolean;
   focused: boolean;
@@ -1110,6 +1115,7 @@ function ProjectAgentPane({
   const [terminalReady, setTerminalReady] = useState(selected || focused);
   const [paneView, setPaneView] = useState<"chat" | "terminal">("chat");
   const adapter = runtimeAdapters[agent.runtime];
+  const sessionScope = `${roomId}:${agent.id}`;
   const context = {
     ...runtimeContext,
     systemPrompt: () => systemPromptFor(agent, allAgents),
@@ -1181,9 +1187,11 @@ function ProjectAgentPane({
           {terminalReady ? (
             <TerminalPane
               id={agent.id}
+              agentId={agent.id}
+              sessionScope={sessionScope}
               cmd={adapter.command}
-              args={adapter.freshArgs(agent.id, context)}
-              continueArgs={adapter.resumeArgs(agent.id, context)}
+              args={adapter.freshArgs(agent.id, context, agent.sessionId)}
+              continueArgs={adapter.resumeArgs(agent.id, context, agent.sessionId)}
               initialUseContinue={shouldResume}
               onSessionStarted={() => onSessionStarted(agent.id)}
               cwd={agent.cwd ?? undefined}
@@ -1195,18 +1203,19 @@ function ProjectAgentPane({
           )}
         </div>
         <div className={`pane-layer ${paneView === "chat" ? "is-active" : ""}`} aria-hidden={paneView !== "chat"}>
-          <AgentTranscriptChat agent={agent} active={paneView === "chat"} />
+          <AgentTranscriptChat roomId={roomId} agent={agent} active={paneView === "chat"} />
         </div>
       </div>
     </article>
   );
 }
 
-function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: boolean }) {
+function AgentTranscriptChat({ roomId, agent, active }: { roomId: string; agent: AgentRecord; active: boolean }) {
   const [transcript, setTranscript] = useState<ClaudeTranscript | null>(null);
   const [error, setError] = useState<string | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const isClaude = agent.runtime === "claude";
+  const transcriptKey = `${roomId}:${agent.id}`;
 
   useEffect(() => {
     if (!active || !agent.cwd || !isClaude) return;
@@ -1214,7 +1223,12 @@ function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: bo
     let unlistenTranscript: UnlistenFn | undefined;
     let unlistenError: UnlistenFn | undefined;
 
-    appInvoke<ClaudeTranscript>("read_claude_transcript", { agentId: agent.id, cwd: agent.cwd, limit: 80 })
+    appInvoke<ClaudeTranscript>("read_claude_transcript", {
+      agentId: transcriptKey,
+      cwd: agent.cwd,
+      limit: 80,
+      sessionId: agent.sessionId,
+    })
       .then((nextTranscript) => {
         if (cancelled) return;
         setTranscript(nextTranscript);
@@ -1226,7 +1240,7 @@ function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: bo
       });
 
     if (hasTauriBridge()) {
-      listen<ClaudeTranscriptEvent>(`claude:transcript:${agent.id}`, (event) => {
+      listen<ClaudeTranscriptEvent>(`claude:transcript:${transcriptKey}`, (event) => {
         if (cancelled) return;
         setTranscript(event.payload.transcript);
         setError(null);
@@ -1238,7 +1252,7 @@ function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: bo
         unlistenTranscript = unlisten;
       });
 
-      listen<ClaudeTranscriptErrorEvent>(`claude:transcript-error:${agent.id}`, (event) => {
+      listen<ClaudeTranscriptErrorEvent>(`claude:transcript-error:${transcriptKey}`, (event) => {
         if (cancelled) return;
         setError(event.payload.error);
       }).then((unlisten) => {
@@ -1249,7 +1263,12 @@ function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: bo
         unlistenError = unlisten;
       });
 
-      appInvoke("watch_claude_transcript", { agentId: agent.id, cwd: agent.cwd, limit: 80 }).catch((watchError) => {
+      appInvoke("watch_claude_transcript", {
+        agentId: transcriptKey,
+        cwd: agent.cwd,
+        limit: 80,
+        sessionId: agent.sessionId,
+      }).catch((watchError) => {
         if (!cancelled) setError(String(watchError));
       });
     }
@@ -1259,10 +1278,10 @@ function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: bo
       unlistenTranscript?.();
       unlistenError?.();
       if (hasTauriBridge()) {
-        appInvoke("stop_claude_transcript_watch", { agentId: agent.id }).catch(() => {});
+        appInvoke("stop_claude_transcript_watch", { agentId: transcriptKey }).catch(() => {});
       }
     };
-  }, [active, agent.cwd, agent.id, isClaude]);
+  }, [active, agent.cwd, isClaude, transcriptKey]);
 
   useEffect(() => {
     if (!active) return;

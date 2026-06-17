@@ -270,12 +270,22 @@ fn read_bound_transcript(
     agent_id: &str,
     cwd: &Path,
     limit: usize,
+    session_id: Option<&str>,
 ) -> Result<ClaudeTranscript, String> {
     if let Some(path) = watchers.bindings.lock().get(agent_id).cloned() {
         if let Some(transcript) = read_transcript_for_path(&path, cwd, limit)? {
             return Ok(transcript);
         }
         watchers.bindings.lock().remove(agent_id);
+    }
+
+    if let Some(session_id) = session_id {
+        let path = claude_projects_dir()?.join(claude_project_dir_name(cwd)).join(format!("{}.jsonl", session_id));
+        if let Some(transcript) = read_transcript_for_path(&path, cwd, limit)? {
+            watchers.bindings.lock().insert(agent_id.to_string(), path);
+            return Ok(transcript);
+        }
+        return Ok(empty_transcript());
     }
 
     let matches = bindable_transcripts(cwd, limit)?;
@@ -332,9 +342,20 @@ pub fn read_claude_transcript(
     cwd: String,
     limit: Option<usize>,
     agent_id: Option<String>,
+    session_id: Option<String>,
 ) -> Result<ClaudeTranscript, String> {
     let cwd = PathBuf::from(cwd);
     let limit = limit.unwrap_or(80).clamp(1, 200);
+    if let Some(session_id) = session_id {
+        let path = claude_projects_dir()?.join(claude_project_dir_name(&cwd)).join(format!("{}.jsonl", session_id));
+        if let Some(transcript) = read_transcript_for_path(&path, &cwd, limit)? {
+            if let Some(agent_id) = agent_id {
+                watchers.bindings.lock().insert(agent_id, path);
+            }
+            return Ok(transcript);
+        }
+        return Ok(empty_transcript());
+    }
     if let Some(agent_id) = agent_id {
         return read_existing_bound_transcript(&watchers, &agent_id, &cwd, limit);
     }
@@ -348,6 +369,7 @@ pub fn watch_claude_transcript(
     agent_id: String,
     cwd: String,
     limit: Option<usize>,
+    session_id: Option<String>,
 ) -> Result<(), String> {
     stop_claude_transcript_watch(watchers.clone(), agent_id.clone())?;
 
@@ -364,7 +386,7 @@ pub fn watch_claude_transcript(
     std::thread::spawn(move || {
         let mut last_signature = String::new();
         while !stop.load(Ordering::Relaxed) {
-            match read_bound_transcript(&watcher_state, &agent_id, &cwd, limit) {
+            match read_bound_transcript(&watcher_state, &agent_id, &cwd, limit, session_id.as_deref()) {
                 Ok(transcript) => {
                     let signature = transcript_signature(&transcript);
                     if signature != last_signature {

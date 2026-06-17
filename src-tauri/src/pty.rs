@@ -60,6 +60,10 @@ struct PtyExitEvent {
 #[serde(rename_all = "camelCase")]
 pub struct SpawnArgs {
     pub id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_scope: Option<String>,
     pub cwd: Option<String>,
     pub cmd: String,
     pub args: Vec<String>,
@@ -183,7 +187,8 @@ pub fn spawn_pty(
     registry: State<'_, PtyRegistry>,
     args: SpawnArgs,
 ) -> Result<(), String> {
-    let SpawnArgs { id, cwd, cmd, args: cmd_args, cols, rows } = args;
+    let SpawnArgs { id, agent_id, session_scope, cwd, cmd, args: cmd_args, cols, rows } = args;
+    let agent_env_id = agent_id.unwrap_or_else(|| id.clone());
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -208,10 +213,11 @@ pub fn spawn_pty(
     }
     cmd_builder.env("PATH", command_path(path_value.unwrap_or_default()));
     cmd_builder.env("TERM", "xterm-256color");
-    cmd_builder.env("FLEET_AGENT_ID", &id);
+    cmd_builder.env("FLEET_AGENT_ID", &agent_env_id);
     cmd_builder.env("FLEET_SOCKET", "/tmp/claude-fleet.sock");
     if cmd == "codex" {
-        if let Some(codex_home) = isolated_codex_home(&id)? {
+        let codex_scope = session_scope.as_deref().unwrap_or(&agent_env_id);
+        if let Some(codex_home) = isolated_codex_home(codex_scope)? {
             cmd_builder.env("CODEX_HOME", codex_home.to_string_lossy().to_string());
         }
     }

@@ -9,8 +9,8 @@ type RuntimeContext = {
 type RuntimeAdapter = {
   label: string;
   command: string;
-  freshArgs: (agentId: string, context: RuntimeContext) => string[];
-  resumeArgs: (agentId: string, context: RuntimeContext) => string[];
+  freshArgs: (agentId: string, context: RuntimeContext, sessionId?: string | null) => string[];
+  resumeArgs: (agentId: string, context: RuntimeContext, sessionId?: string | null) => string[];
 };
 
 const tomlString = (value: string): string => JSON.stringify(value);
@@ -31,15 +31,19 @@ export const runtimeAdapters: Record<AgentRuntime, RuntimeAdapter> = {
   claude: {
     label: "Claude",
     command: "claude",
-    freshArgs: (agentId, context) => [
+    freshArgs: (agentId, context, sessionId) => [
+      ...(sessionId ? ["--session-id", sessionId] : []),
       "--append-system-prompt",
       context.systemPrompt(agentId),
       "--mcp-config",
       context.mcpConfigPath,
     ],
-    resumeArgs: (agentId, context) => [
-      "--continue",
-      ...runtimeAdapters.claude.freshArgs(agentId, context),
+    resumeArgs: (agentId, context, sessionId) => [
+      ...(sessionId ? ["--resume", sessionId] : ["--continue"]),
+      "--append-system-prompt",
+      context.systemPrompt(agentId),
+      "--mcp-config",
+      context.mcpConfigPath,
     ],
   },
   codex: {
