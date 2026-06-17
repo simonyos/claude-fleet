@@ -214,8 +214,33 @@ pub struct WorkspaceRecord {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RoomRecord {
+    pub id: String,
+    pub workspace: ProjectWorkspace,
+    #[serde(default)]
+    pub main_agent_id: Option<String>,
+    pub agents: Vec<AgentRecord>,
+    #[serde(default)]
+    pub tasks: Vec<TaskRecord>,
+    #[serde(default)]
+    pub orchestrator_chat: Vec<ChatMessageRecord>,
+    pub messages: Vec<MessageRecord>,
+    pub runs: Vec<RunRecord>,
+    pub workspaces: Vec<WorkspaceRecord>,
+    #[serde(default)]
+    pub selected_agent_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FleetState {
     pub schema_version: u32,
+    #[serde(default)]
+    pub active_room_id: Option<String>,
+    #[serde(default)]
+    pub rooms: Vec<RoomRecord>,
     #[serde(default)]
     pub active_workspace: Option<ProjectWorkspace>,
     #[serde(default)]
@@ -231,7 +256,9 @@ pub struct FleetState {
 
 fn default_state() -> FleetState {
     FleetState {
-        schema_version: 3,
+        schema_version: 4,
+        active_room_id: None,
+        rooms: vec![],
         active_workspace: None,
         main_agent_id: None,
         agents: vec![],

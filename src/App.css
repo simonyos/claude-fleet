@@ -148,7 +148,8 @@ textarea {
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
-.roster-agent:focus-visible {
+.roster-agent:focus-visible,
+.room-tab:focus-visible {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--focus);
@@ -183,6 +184,7 @@ textarea {
 .room-shell {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 392px;
+  grid-template-rows: auto minmax(0, 1fr);
   background: var(--bg);
 }
 
@@ -195,10 +197,85 @@ textarea {
 }
 
 .room-shell.is-focus-mode .room-workbench {
+  grid-column: 1;
   padding: 14px;
 }
 
+.room-tabs {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  min-width: 0;
+  border-bottom: 1px solid var(--line);
+  background: #07080a;
+}
+
+.room-tab-strip {
+  display: flex;
+  align-items: end;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 7px 10px 0;
+}
+
+.room-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 108px;
+  max-width: 220px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 7px 7px 0 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+  cursor: pointer;
+}
+
+.room-tab:hover {
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.room-tab.is-active {
+  border-color: var(--line);
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.room-tab span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-tab small {
+  flex: 0 0 auto;
+  min-width: 18px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--subtle);
+  font: 10px var(--font-mono);
+  text-align: center;
+}
+
+.add-room-tab {
+  justify-content: center;
+  min-width: 36px;
+  max-width: 36px;
+  color: var(--accent);
+  font-size: 17px;
+}
+
 .room-dock {
+  grid-column: 2;
+  grid-row: 2;
   min-width: 0;
   min-height: 0;
   background: var(--rail);
@@ -412,6 +489,8 @@ textarea {
 }
 
 .room-workbench {
+  grid-column: 1;
+  grid-row: 2;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 12px;
@@ -1126,6 +1205,7 @@ textarea {
 
 .setup-shell {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   grid-template-columns: minmax(240px, 360px) minmax(420px, 560px);
   align-content: center;
   justify-content: center;
@@ -1134,6 +1214,11 @@ textarea {
   height: 100vh;
   padding: 32px;
   background: var(--bg);
+}
+
+.setup-shell .room-tabs {
+  position: fixed;
+  inset: 0 0 auto;
 }
 
 .setup-brand {
@@ -1208,34 +1293,34 @@ textarea {
 
   .room-workbench {
     grid-column: 1;
-    grid-row: 1;
+    grid-row: 2;
   }
 
   .room-dock {
     grid-column: 2;
-    grid-row: 1;
+    grid-row: 2;
   }
 }
 
 @media (max-width: 760px) {
   .room-shell {
-    grid-template-rows: minmax(0, 1fr) 360px;
+    grid-template-rows: auto minmax(0, 1fr) 360px;
     grid-template-columns: 1fr;
   }
 
   .room-shell.is-focus-mode {
-    grid-template-rows: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .room-workbench {
     grid-column: 1;
-    grid-row: 1;
+    grid-row: 2;
     padding: 12px;
   }
 
   .room-dock {
     grid-column: 1;
-    grid-row: 2;
+    grid-row: 3;
     border-top: 1px solid var(--line);
     border-left: 0;
   }
@@ -1253,9 +1338,11 @@ textarea {
   }
 
   .setup-shell {
+    grid-template-rows: auto auto;
     grid-template-columns: 1fr;
     align-content: start;
     overflow: auto;
+    padding-top: 62px;
   }
 }
 

@@ -80,8 +80,25 @@ type LegacyTaskRecord = {
   updatedAt: string;
 };
 
+type RoomRecord = {
+  id: string;
+  workspace: ProjectWorkspace;
+  mainAgentId: string | null;
+  agents: AgentRecord[];
+  tasks: LegacyTaskRecord[];
+  orchestratorChat: unknown[];
+  messages: MessageRecord[];
+  runs: unknown[];
+  workspaces: unknown[];
+  selectedAgentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type FleetState = {
   schemaVersion: number;
+  activeRoomId: string | null;
+  rooms: RoomRecord[];
   activeWorkspace: ProjectWorkspace | null;
   mainAgentId: string | null;
   agents: AgentRecord[];
@@ -151,7 +168,9 @@ const sameFleetState = (a: FleetState | null, b: FleetState) => {
 };
 
 const previewFleetState = (): FleetState => ({
-  schemaVersion: 3,
+  schemaVersion: 4,
+  activeRoomId: "preview-room",
+  rooms: [],
   activeWorkspace: {
     id: "preview-room",
     name: "microservices",
@@ -388,8 +407,12 @@ function App() {
         setMcpBinaryPath(binaryPath);
         setMailboxRoot(mailboxPath);
         setFleetState(state);
-        setSelectedAgentId(state.agents[0]?.id ?? null);
-        setManualRecipient(state.agents[0]?.id ?? "");
+        const initialAgentId =
+          state.rooms.find((room) => room.id === state.activeRoomId)?.selectedAgentId ??
+          state.agents[0]?.id ??
+          null;
+        setSelectedAgentId(initialAgentId);
+        setManualRecipient(initialAgentId ?? "");
         setNewAgentPath(state.activeWorkspace?.path ?? "");
       })
       .catch((error) => console.error("Failed to load fleet state:", error));
@@ -432,8 +455,8 @@ function App() {
     };
   }, [fleetState, mcpBinaryPath, mcpConfigPath]);
 
-  const saveState = (nextState: FleetState) => {
-    const normalized = normalizeLoadedState(nextState);
+  const saveState = (nextState: FleetState, selectedAgentOverride = selectedAgentId) => {
+    const normalized = persistActiveRoom(normalizeLoadedState(nextState), selectedAgentOverride);
     setFleetState(normalized);
     appInvoke("save_fleet_state", { state: normalized }).catch((error) =>
       console.error("Failed to save fleet state:", error),
@@ -441,6 +464,25 @@ function App() {
   };
 
   const activateWorkspace = (workspace: ProjectWorkspace) => {
+    if (fleetState) {
+      const currentState = persistActiveRoom(normalizeLoadedState(fleetState), selectedAgentId);
+      const existingRoom = currentState.rooms.find(
+        (room) => room.workspace.id === workspace.id || room.workspace.path === workspace.path,
+      );
+      if (existingRoom) {
+        const nextState = applyRoomToState(currentState, {
+          ...existingRoom,
+          workspace: { ...existingRoom.workspace, name: workspace.name || existingRoom.workspace.name },
+        });
+        const nextSelectedAgentId = existingRoom.selectedAgentId ?? nextState.mainAgentId ?? nextState.agents[0]?.id ?? null;
+        saveState(nextState, nextSelectedAgentId);
+        setSelectedAgentId(nextSelectedAgentId);
+        setManualRecipient(nextSelectedAgentId ?? "");
+        setNewAgentPath(nextState.activeWorkspace?.path ?? "");
+        return;
+      }
+    }
+
     const firstAgent = createAgent({
       id: "agent-1",
       label: workspace.name,
@@ -450,7 +492,9 @@ function App() {
       index: 0,
     });
     const nextState: FleetState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
+      activeRoomId: workspace.id,
+      rooms: fleetState ? persistActiveRoom(normalizeLoadedState(fleetState), selectedAgentId).rooms : [],
       activeWorkspace: workspace,
       mainAgentId: firstAgent.id,
       agents: [firstAgent],
@@ -460,10 +504,48 @@ function App() {
       runs: [],
       workspaces: [],
     };
-    saveState(nextState);
+    saveState(nextState, firstAgent.id);
     setSelectedAgentId(firstAgent.id);
     setManualRecipient(firstAgent.id);
     setNewAgentPath(workspace.path);
+  };
+
+  const switchRoom = (roomId: string) => {
+    if (!fleetState) return;
+    const currentState = persistActiveRoom(normalizeLoadedState(fleetState), selectedAgentId);
+    const room = currentState.rooms.find((item) => item.id === roomId);
+    if (!room) return;
+    const nextState = applyRoomToState(currentState, room);
+    const nextSelectedAgentId = room.selectedAgentId ?? nextState.mainAgentId ?? nextState.agents[0]?.id ?? null;
+    saveState(nextState, nextSelectedAgentId);
+    setSelectedAgentId(nextSelectedAgentId);
+    setManualRecipient(nextSelectedAgentId ?? "");
+    setNewAgentPath(nextState.activeWorkspace?.path ?? "");
+    setIsFocusMode(false);
+    setIsEditAgentOpen(false);
+  };
+
+  const startNewRoom = () => {
+    if (!fleetState) return;
+    const currentState = persistActiveRoom(normalizeLoadedState(fleetState), selectedAgentId);
+    const nextState = normalizeLoadedState({
+      ...currentState,
+      activeRoomId: null,
+      activeWorkspace: null,
+      mainAgentId: null,
+      agents: [],
+      tasks: [],
+      orchestratorChat: [],
+      messages: [],
+      runs: [],
+      workspaces: [],
+    });
+    saveState(nextState);
+    setSelectedAgentId(null);
+    setManualRecipient("");
+    setSetupPath("");
+    setSetupName("");
+    setIsFocusMode(false);
   };
 
   const openWorkspace = async () => {
@@ -527,7 +609,7 @@ function App() {
 
   const resetRoom = () => {
     if (!fleetState) return;
-    saveState({ ...fleetState, activeWorkspace: null });
+    startNewRoom();
   };
 
   const addAgent = () => {
@@ -577,12 +659,12 @@ function App() {
       if (!current) return current;
       const existing = current.agents.find((agent) => agent.id === id);
       if (!existing || existing.sessionId) return current;
-      const normalized = normalizeLoadedState({
+      const normalized = persistActiveRoom(normalizeLoadedState({
         ...current,
         agents: current.agents.map((agent) =>
           agent.id === id ? { ...agent, sessionId: sessionMarker(id) } : agent,
         ),
-      });
+      }), selectedAgentId);
       appInvoke("save_fleet_state", { state: normalized }).catch((error) =>
         console.error("Failed to save agent session marker:", error),
       );
@@ -639,6 +721,14 @@ function App() {
   if (!fleetState.activeWorkspace) {
     return (
       <WorkspaceSetup
+        tabs={
+          <RoomTabs
+            rooms={fleetState.rooms}
+            activeRoomId={fleetState.activeRoomId}
+            onSelectRoom={switchRoom}
+            onNewRoom={startNewRoom}
+          />
+        }
         path={setupPath}
         name={setupName}
         error={setupError}
@@ -653,6 +743,12 @@ function App() {
 
   return (
     <main className={`app-shell room-shell ${isFocusMode ? "is-focus-mode" : ""}`}>
+      <RoomTabs
+        rooms={fleetState.rooms}
+        activeRoomId={fleetState.activeRoomId}
+        onSelectRoom={switchRoom}
+        onNewRoom={startNewRoom}
+      />
       <section className="room-workbench">
         <header className="workbench-bar">
           <div>
@@ -675,7 +771,7 @@ function App() {
             <div className={`agent-grid ${isFocusMode ? "is-focused" : ""}`}>
               {fleetState.agents.map((agent) => (
                 <ProjectAgentPane
-                  key={agent.id}
+                  key={`${fleetState.activeRoomId ?? "room"}:${agent.id}`}
                   agent={agent}
                   selected={agent.id === selectedAgent?.id}
                   focused={isFocusMode && agent.id === selectedAgent?.id}
@@ -805,9 +901,8 @@ function App() {
   );
 }
 
-function normalizeLoadedState(state: FleetState): FleetState {
-  const workspacePath = state.activeWorkspace?.path ?? null;
-  const agents = state.agents.map((agent, index) => {
+function normalizeAgents(agents: AgentRecord[], workspacePath: string | null): AgentRecord[] {
+  return agents.map((agent, index) => {
     const isLegacyOrchestrator = agent.id === "orchestrator" || agent.role === "orchestrator";
     return {
       ...agent,
@@ -835,10 +930,114 @@ function normalizeLoadedState(state: FleetState): FleetState {
       status: agent.status || "idle",
     };
   });
+}
+
+function normalizeRoom(room: RoomRecord): RoomRecord {
+  const agents = normalizeAgents(room.agents ?? [], room.workspace.path);
+  return {
+    ...room,
+    id: room.id || room.workspace.id,
+    workspace: room.workspace,
+    mainAgentId:
+      room.mainAgentId && agents.some((agent) => agent.id === room.mainAgentId)
+        ? room.mainAgentId
+        : agents[0]?.id ?? null,
+    agents,
+    tasks: [],
+    orchestratorChat: [],
+    messages: room.messages ?? [],
+    runs: [],
+    workspaces: room.workspaces ?? [],
+    selectedAgentId:
+      room.selectedAgentId && agents.some((agent) => agent.id === room.selectedAgentId)
+        ? room.selectedAgentId
+        : agents[0]?.id ?? null,
+    createdAt: room.createdAt ?? room.workspace.createdAt,
+    updatedAt: room.updatedAt ?? room.workspace.createdAt,
+  };
+}
+
+function snapshotActiveRoom(
+  state: FleetState,
+  selectedAgentId?: string | null,
+  updatedAt?: string,
+): RoomRecord | null {
+  if (!state.activeWorkspace) return null;
+  return normalizeRoom({
+    id: state.activeRoomId ?? state.activeWorkspace.id,
+    workspace: state.activeWorkspace,
+    mainAgentId: state.mainAgentId,
+    agents: state.agents,
+    tasks: state.tasks,
+    orchestratorChat: state.orchestratorChat,
+    messages: state.messages,
+    runs: state.runs,
+    workspaces: state.workspaces,
+    selectedAgentId: selectedAgentId ?? state.mainAgentId ?? state.agents[0]?.id ?? null,
+    createdAt: state.activeWorkspace.createdAt,
+    updatedAt: updatedAt ?? state.activeWorkspace.createdAt,
+  });
+}
+
+function upsertRoom(rooms: RoomRecord[], room: RoomRecord): RoomRecord[] {
+  const nextRooms = rooms.filter((item) => item.id !== room.id);
+  return [room, ...nextRooms];
+}
+
+function persistActiveRoom(state: FleetState, selectedAgentId?: string | null): FleetState {
+  const snapshot = snapshotActiveRoom(state, selectedAgentId, new Date().toISOString());
+  if (!snapshot) return state;
+  return {
+    ...state,
+    activeRoomId: snapshot.id,
+    rooms: upsertRoom(state.rooms ?? [], snapshot),
+  };
+}
+
+function applyRoomToState(state: FleetState, room: RoomRecord): FleetState {
+  const normalizedRoom = normalizeRoom(room);
+  return normalizeLoadedState({
+    ...state,
+    activeRoomId: normalizedRoom.id,
+    activeWorkspace: normalizedRoom.workspace,
+    mainAgentId: normalizedRoom.mainAgentId,
+    agents: normalizedRoom.agents,
+    tasks: normalizedRoom.tasks,
+    orchestratorChat: normalizedRoom.orchestratorChat,
+    messages: normalizedRoom.messages,
+    runs: normalizedRoom.runs,
+    workspaces: normalizedRoom.workspaces,
+    rooms: upsertRoom(state.rooms ?? [], normalizedRoom),
+  });
+}
+
+function normalizeLoadedState(state: FleetState): FleetState {
+  const workspacePath = state.activeWorkspace?.path ?? null;
+  const agents = normalizeAgents(state.agents ?? [], workspacePath);
+  const savedRooms = (state.rooms ?? []).map(normalizeRoom);
+  const activeRoomId = state.activeRoomId ?? state.activeWorkspace?.id ?? savedRooms[0]?.id ?? null;
+  const activeSelectedAgentId = savedRooms.find((room) => room.id === activeRoomId)?.selectedAgentId ?? state.mainAgentId;
+  const activeSnapshot = snapshotActiveRoom(
+    {
+      ...state,
+      activeRoomId,
+      agents,
+      tasks: [],
+      orchestratorChat: [],
+      messages: state.messages ?? [],
+      runs: [],
+      workspaces: state.workspaces ?? [],
+      rooms: savedRooms,
+    },
+    activeSelectedAgentId,
+  );
+  const rooms = activeSnapshot ? upsertRoom(savedRooms, activeSnapshot) : savedRooms;
 
   return {
     ...state,
-    schemaVersion: 3,
+    schemaVersion: 4,
+    activeRoomId,
+    rooms,
     mainAgentId:
       state.mainAgentId && agents.some((agent) => agent.id === state.mainAgentId)
         ? state.mainAgentId
@@ -850,6 +1049,40 @@ function normalizeLoadedState(state: FleetState): FleetState {
     runs: [],
     workspaces: state.workspaces ?? [],
   };
+}
+
+function RoomTabs({
+  rooms,
+  activeRoomId,
+  onSelectRoom,
+  onNewRoom,
+}: {
+  rooms: RoomRecord[];
+  activeRoomId: string | null;
+  onSelectRoom: (id: string) => void;
+  onNewRoom: () => void;
+}) {
+  return (
+    <nav className="room-tabs" aria-label="Rooms">
+      <div className="room-tab-strip">
+        {rooms.map((room) => (
+          <button
+            className={`room-tab ${room.id === activeRoomId ? "is-active" : ""}`}
+            key={room.id}
+            onClick={() => onSelectRoom(room.id)}
+            title={room.workspace.path}
+            type="button"
+          >
+            <span>{room.workspace.name}</span>
+            <small>{room.agents.length}</small>
+          </button>
+        ))}
+        <button className="room-tab add-room-tab" onClick={onNewRoom} type="button" title="New room">
+          +
+        </button>
+      </div>
+    </nav>
+  );
 }
 
 function ProjectAgentPane({
@@ -1455,6 +1688,7 @@ function AddAgentModal({
 }
 
 function WorkspaceSetup({
+  tabs,
   path,
   name,
   error,
@@ -1464,6 +1698,7 @@ function WorkspaceSetup({
   onCreate,
   onBrowse,
 }: {
+  tabs?: React.ReactNode;
   path: string;
   name: string;
   error: string | null;
@@ -1475,6 +1710,7 @@ function WorkspaceSetup({
 }) {
   return (
     <main className="setup-shell">
+      {tabs}
       <section className="setup-brand">
         <div className="eyebrow">Context federation</div>
         <h1>claude-fleet</h1>
