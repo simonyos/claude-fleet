@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible problem in Claude Fleet
+title: "Bug: "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Add agent ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, shell, Claude/Codex CLI versions, dev or built app.
+      placeholder: |
+        macOS:
+        App mode: tauri dev / built app
+        claude --version:
+        codex --version:
+    validations:
+      required: false

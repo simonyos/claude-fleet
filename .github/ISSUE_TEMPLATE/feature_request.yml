@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose an improvement for Claude Fleet
+title: "Feature: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should Claude Fleet do differently?
+    validations:
+      required: true
+  - type: textarea
+    id: primitive
+    attributes:
+      label: Primitive impact
+      description: How does this affect terminals, files, MCP messages, mailbox state, or agent control?
+    validations:
+      required: false
