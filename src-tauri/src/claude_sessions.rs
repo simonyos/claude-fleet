@@ -177,6 +177,7 @@ fn parse_transcript(
     path: &Path,
     cwd: &Path,
     limit: usize,
+    require_cwd_match: bool,
 ) -> Result<Option<ClaudeTranscript>, String> {
     let text = read_tail(path, 768 * 1024)?;
     let mut saw_matching_cwd = false;
@@ -236,7 +237,8 @@ fn parse_transcript(
         });
     }
 
-    if !saw_matching_cwd
+    if require_cwd_match
+        && !saw_matching_cwd
         && path
             .parent()
             .map(|parent| parent.ends_with(claude_project_dir_name(cwd)))
@@ -244,7 +246,7 @@ fn parse_transcript(
     {
         saw_matching_cwd = true;
     }
-    if !saw_matching_cwd {
+    if require_cwd_match && !saw_matching_cwd {
         return Ok(None);
     }
 
@@ -277,7 +279,7 @@ fn empty_transcript() -> ClaudeTranscript {
 
 fn read_transcript_for_cwd(cwd: &Path, limit: usize) -> Result<ClaudeTranscript, String> {
     for path in transcript_candidates(cwd)?.into_iter().take(40) {
-        if let Some(transcript) = parse_transcript(&path, cwd, limit)? {
+        if let Some(transcript) = parse_transcript(&path, cwd, limit, true)? {
             return Ok(transcript);
         }
     }
@@ -288,11 +290,12 @@ fn read_transcript_for_path(
     path: &Path,
     cwd: &Path,
     limit: usize,
+    require_cwd_match: bool,
 ) -> Result<Option<ClaudeTranscript>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    parse_transcript(path, cwd, limit)
+    parse_transcript(path, cwd, limit, require_cwd_match)
 }
 
 fn read_transcript_for_session(
@@ -301,7 +304,7 @@ fn read_transcript_for_session(
     session_id: &str,
 ) -> Result<Option<(PathBuf, ClaudeTranscript)>, String> {
     for path in session_transcript_paths(cwd, session_id)? {
-        if let Some(transcript) = read_transcript_for_path(&path, cwd, limit)? {
+        if let Some(transcript) = read_transcript_for_path(&path, cwd, limit, false)? {
             return Ok(Some((path, transcript)));
         }
     }
@@ -321,7 +324,7 @@ fn bindable_transcripts(
 ) -> Result<Vec<(PathBuf, ClaudeTranscript)>, String> {
     let mut matches = Vec::new();
     for path in transcript_candidates(cwd)?.into_iter().take(40) {
-        if let Some(transcript) = parse_transcript(&path, cwd, limit)? {
+        if let Some(transcript) = parse_transcript(&path, cwd, limit, true)? {
             matches.push((path, transcript));
         }
     }
@@ -336,7 +339,8 @@ fn read_bound_transcript(
     session_id: Option<&str>,
 ) -> Result<ClaudeTranscript, String> {
     if let Some(path) = watchers.bindings.lock().get(agent_id).cloned() {
-        if let Some(transcript) = read_transcript_for_path(&path, cwd, limit)? {
+        if let Some(transcript) = read_transcript_for_path(&path, cwd, limit, session_id.is_none())?
+        {
             return Ok(transcript);
         }
         watchers.bindings.lock().remove(agent_id);
@@ -379,7 +383,7 @@ fn read_existing_bound_transcript(
     let Some(path) = watchers.bindings.lock().get(agent_id).cloned() else {
         return Ok(empty_transcript());
     };
-    if let Some(transcript) = read_transcript_for_path(&path, cwd, limit)? {
+    if let Some(transcript) = read_transcript_for_path(&path, cwd, limit, true)? {
         return Ok(transcript);
     }
     watchers.bindings.lock().remove(agent_id);

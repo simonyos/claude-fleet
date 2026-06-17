@@ -129,6 +129,8 @@ const agentColors = [
 const encode = (data: string) => Array.from(new TextEncoder().encode(data));
 const defaultAgentColor = (index: number) => agentColors[index % agentColors.length];
 const hasTauriBridge = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const scopedAgentId = (roomId: string | null | undefined, agentId: string) =>
+  roomId ? `${roomId}:${agentId}` : agentId;
 const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const createSessionId = () =>
   globalThis.crypto?.randomUUID?.() ??
@@ -684,9 +686,10 @@ function App() {
     setIsSendingMessage(true);
     try {
       const body = `[from human]: ${trimmedMessage}`;
-      await appInvoke("write_pty", { id: manualRecipient, data: encode(body) });
+      const targetPtyId = scopedAgentId(fleetState?.activeRoomId ?? fleetState?.activeWorkspace?.id, manualRecipient);
+      await appInvoke("write_pty", { id: targetPtyId, data: encode(body) });
       window.setTimeout(() => {
-        appInvoke("write_pty", { id: manualRecipient, data: encode("\r") }).catch((error) =>
+        appInvoke("write_pty", { id: targetPtyId, data: encode("\r") }).catch((error) =>
           console.error("Failed to submit manual message:", error),
         );
       }, 250);
@@ -1122,6 +1125,7 @@ function ProjectAgentPane({
   const [paneView, setPaneView] = useState<"chat" | "terminal">("chat");
   const adapter = runtimeAdapters[agent.runtime];
   const sessionScope = `${roomId}:${agent.id}`;
+  const ptyId = scopedAgentId(roomId, agent.id);
   const context = {
     ...runtimeContext,
     systemPrompt: () => systemPromptFor(agent, allAgents),
@@ -1192,7 +1196,7 @@ function ProjectAgentPane({
         <div className={`pane-layer ${paneView === "terminal" ? "is-active" : ""}`} aria-hidden={paneView !== "terminal"}>
           {terminalReady ? (
             <TerminalPane
-              id={agent.id}
+              id={ptyId}
               agentId={agent.id}
               sessionScope={sessionScope}
               cmd={adapter.command}

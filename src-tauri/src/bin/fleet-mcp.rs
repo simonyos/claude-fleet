@@ -115,7 +115,10 @@ fn handle(req: JsonRpcRequest) {
                         return;
                     }
                     let from = env::var("FLEET_AGENT_ID").ok();
-                    let payload = json!({ "from": from, "to": to, "body": body }).to_string();
+                    let from_room = env::var("FLEET_ROOM_ID").ok();
+                    let payload =
+                        json!({ "from": from, "fromRoom": from_room, "to": to, "body": body })
+                            .to_string();
                     match call_bus(&payload) {
                         Ok(resp) if resp == "ok" => format!("Message delivered to {}", to),
                         Ok(resp) => format!("Bus: {}", resp),
@@ -132,7 +135,10 @@ fn handle(req: JsonRpcRequest) {
                 }
             };
 
-            ok(req.id, json!({ "content": [{ "type": "text", "text": text }] }));
+            ok(
+                req.id,
+                json!({ "content": [{ "type": "text", "text": text }] }),
+            );
         }
         m if m.starts_with("notifications/") => {}
         _ => {
