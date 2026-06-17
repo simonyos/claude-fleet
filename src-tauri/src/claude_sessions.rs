@@ -12,9 +12,10 @@ use std::sync::{
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ClaudeSessionWatchers {
-    stops: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    stops: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    bindings: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -240,6 +241,76 @@ fn read_transcript_for_cwd(cwd: &Path, limit: usize) -> Result<ClaudeTranscript,
     Ok(empty_transcript())
 }
 
+fn read_transcript_for_path(path: &Path, cwd: &Path, limit: usize) -> Result<Option<ClaudeTranscript>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    parse_transcript(path, cwd, limit)
+}
+
+fn transcript_has_agent_marker(path: &Path, agent_id: &str) -> bool {
+    let Ok(text) = read_tail(path, 256 * 1024) else {
+        return false;
+    };
+    text.contains(agent_id) || text.contains(&format!("Consult with {}", agent_id))
+}
+
+fn bindable_transcripts(cwd: &Path, limit: usize) -> Result<Vec<(PathBuf, ClaudeTranscript)>, String> {
+    let mut matches = Vec::new();
+    for path in transcript_candidates(cwd)?.into_iter().take(40) {
+        if let Some(transcript) = parse_transcript(&path, cwd, limit)? {
+            matches.push((path, transcript));
+        }
+    }
+    Ok(matches)
+}
+
+fn read_bound_transcript(
+    watchers: &ClaudeSessionWatchers,
+    agent_id: &str,
+    cwd: &Path,
+    limit: usize,
+) -> Result<ClaudeTranscript, String> {
+    if let Some(path) = watchers.bindings.lock().get(agent_id).cloned() {
+        if let Some(transcript) = read_transcript_for_path(&path, cwd, limit)? {
+            return Ok(transcript);
+        }
+        watchers.bindings.lock().remove(agent_id);
+    }
+
+    let matches = bindable_transcripts(cwd, limit)?;
+    if let Some((path, transcript)) = matches
+        .iter()
+        .find(|(path, _)| transcript_has_agent_marker(path, agent_id))
+    {
+        watchers.bindings.lock().insert(agent_id.to_string(), path.clone());
+        return Ok(transcript.clone());
+    }
+
+    if let Some((path, transcript)) = matches.into_iter().next() {
+        watchers.bindings.lock().insert(agent_id.to_string(), path);
+        return Ok(transcript);
+    }
+
+    Ok(empty_transcript())
+}
+
+fn read_existing_bound_transcript(
+    watchers: &ClaudeSessionWatchers,
+    agent_id: &str,
+    cwd: &Path,
+    limit: usize,
+) -> Result<ClaudeTranscript, String> {
+    let Some(path) = watchers.bindings.lock().get(agent_id).cloned() else {
+        return Ok(empty_transcript());
+    };
+    if let Some(transcript) = read_transcript_for_path(&path, cwd, limit)? {
+        return Ok(transcript);
+    }
+    watchers.bindings.lock().remove(agent_id);
+    Ok(empty_transcript())
+}
+
 fn transcript_signature(transcript: &ClaudeTranscript) -> String {
     let last_id = transcript
         .messages
@@ -256,9 +327,17 @@ fn transcript_signature(transcript: &ClaudeTranscript) -> String {
 }
 
 #[tauri::command]
-pub fn read_claude_transcript(cwd: String, limit: Option<usize>) -> Result<ClaudeTranscript, String> {
+pub fn read_claude_transcript(
+    watchers: State<'_, ClaudeSessionWatchers>,
+    cwd: String,
+    limit: Option<usize>,
+    agent_id: Option<String>,
+) -> Result<ClaudeTranscript, String> {
     let cwd = PathBuf::from(cwd);
     let limit = limit.unwrap_or(80).clamp(1, 200);
+    if let Some(agent_id) = agent_id {
+        return read_existing_bound_transcript(&watchers, &agent_id, &cwd, limit);
+    }
     read_transcript_for_cwd(&cwd, limit)
 }
 
@@ -277,10 +356,15 @@ pub fn watch_claude_transcript(
 
     let cwd = PathBuf::from(cwd);
     let limit = limit.unwrap_or(80).clamp(1, 200);
+    let watcher_state = ClaudeSessionWatchers {
+        stops: watchers.stops.clone(),
+        bindings: watchers.bindings.clone(),
+    };
+
     std::thread::spawn(move || {
         let mut last_signature = String::new();
         while !stop.load(Ordering::Relaxed) {
-            match read_transcript_for_cwd(&cwd, limit) {
+            match read_bound_transcript(&watcher_state, &agent_id, &cwd, limit) {
                 Ok(transcript) => {
                     let signature = transcript_signature(&transcript);
                     if signature != last_signature {

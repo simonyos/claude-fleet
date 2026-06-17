@@ -981,7 +981,7 @@ function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: bo
     let unlistenTranscript: UnlistenFn | undefined;
     let unlistenError: UnlistenFn | undefined;
 
-    appInvoke<ClaudeTranscript>("read_claude_transcript", { cwd: agent.cwd, limit: 80 })
+    appInvoke<ClaudeTranscript>("read_claude_transcript", { agentId: agent.id, cwd: agent.cwd, limit: 80 })
       .then((nextTranscript) => {
         if (cancelled) return;
         setTranscript(nextTranscript);
