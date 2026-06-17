@@ -140,6 +140,11 @@ const formatTime = (value: string) => {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
+const toolEventName = (body: string) => {
+  const match = body.trim().match(/^\[tool:\s*([^\]]+)\]$/);
+  return match?.[1] ?? null;
+};
+
 const sameFleetState = (a: FleetState | null, b: FleetState) => {
   if (!a) return false;
   return JSON.stringify(a) === JSON.stringify(b);
@@ -1066,15 +1071,28 @@ function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: bo
       </header>
 
       <div ref={scrollerRef} className="chat-scroll">
-        {messages.map((message) => (
-          <article className={`chat-message is-${message.role}`} key={message.id}>
-            <div className="chat-message-meta">
-              <span>{message.role === "assistant" ? agent.label : "you"}</span>
-              {message.createdAt ? <time>{formatTime(message.createdAt)}</time> : null}
-            </div>
-            <p>{message.body}</p>
-          </article>
-        ))}
+        {messages.map((message) => {
+          const toolName = toolEventName(message.body);
+          if (toolName) {
+            return (
+              <div className="chat-event" key={message.id}>
+                <span>tool</span>
+                <code>{toolName}</code>
+                {message.createdAt ? <time>{formatTime(message.createdAt)}</time> : null}
+              </div>
+            );
+          }
+
+          return (
+            <article className={`chat-message is-${message.role}`} key={message.id}>
+              <div className="chat-message-meta">
+                <span>{message.role === "assistant" ? agent.label : "you"}</span>
+                {message.createdAt ? <time>{formatTime(message.createdAt)}</time> : null}
+              </div>
+              <ChatMessageBody body={message.body} />
+            </article>
+          );
+        })}
         {messages.length === 0 && !error ? (
           <div className="chat-empty-state">
             <strong>No transcript yet</strong>
@@ -1089,6 +1107,77 @@ function AgentTranscriptChat({ agent, active }: { agent: AgentRecord; active: bo
         ) : null}
       </div>
     </section>
+  );
+}
+
+function renderInlineMarkdown(text: string) {
+  const nodes: React.ReactNode[] = [];
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+
+    const token = match[0];
+    if (token.startsWith("`")) {
+      nodes.push(<code key={`${match.index}-code`}>{token.slice(1, -1)}</code>);
+    } else {
+      nodes.push(<strong key={`${match.index}-strong`}>{token.slice(2, -2)}</strong>);
+    }
+    lastIndex = match.index + token.length;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+
+  return nodes;
+}
+
+function ChatMessageBody({ body }: { body: string }) {
+  const segments = body.split(/(```[\s\S]*?```)/g).filter(Boolean);
+
+  return (
+    <div className="chat-message-body">
+      {segments.map((segment, segmentIndex) => {
+        if (segment.startsWith("```") && segment.endsWith("```")) {
+          const code = segment.replace(/^```[^\n]*\n?/, "").replace(/```$/, "").trimEnd();
+          return <pre key={segmentIndex}><code>{code}</code></pre>;
+        }
+
+        return segment
+          .split(/\n{2,}/)
+          .map((block, blockIndex) => {
+            const lines = block.split("\n").map((line) => line.trimEnd()).filter(Boolean);
+            if (lines.length === 0) return null;
+
+            const everyLineIsBullet = lines.every((line) => /^[-*]\s+/.test(line.trim()));
+            if (everyLineIsBullet) {
+              return (
+                <ul key={`${segmentIndex}-${blockIndex}`}>
+                  {lines.map((line, lineIndex) => (
+                    <li key={lineIndex}>{renderInlineMarkdown(line.trim().replace(/^[-*]\s+/, ""))}</li>
+                  ))}
+                </ul>
+              );
+            }
+
+            return (
+              <p key={`${segmentIndex}-${blockIndex}`}>
+                {lines.map((line, lineIndex) => (
+                  <React.Fragment key={lineIndex}>
+                    {lineIndex > 0 ? <br /> : null}
+                    {renderInlineMarkdown(line.trim())}
+                  </React.Fragment>
+                ))}
+              </p>
+            );
+          });
+      })}
+    </div>
   );
 }
 
