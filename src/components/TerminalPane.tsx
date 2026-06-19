@@ -9,6 +9,8 @@ void React;
 
 type Props = {
   id: string;
+  agentId?: string;
+  sessionScope?: string;
   cmd?: string;
   args?: string[];
   continueArgs?: string[];
@@ -21,6 +23,8 @@ const hasTauriBridge = () => typeof window !== "undefined" && "__TAURI_INTERNALS
 
 export function TerminalPane({
   id,
+  agentId,
+  sessionScope,
   cmd = "claude",
   args = [],
   continueArgs,
@@ -42,6 +46,8 @@ export function TerminalPane({
       await invoke("spawn_pty", {
         args: {
           id,
+          agentId,
+          sessionScope,
           cwd,
           cmd,
           args: finalArgs,
@@ -150,7 +156,7 @@ export function TerminalPane({
 
         const initialArgs = initialUseContinue && continueArgs ? continueArgs : args;
         await invoke("spawn_pty", {
-          args: { id, cwd, cmd, args: initialArgs, cols: term.cols, rows: term.rows },
+          args: { id, agentId, sessionScope, cwd, cmd, args: initialArgs, cols: term.cols, rows: term.rows },
         });
         spawned = true;
         lastPtySize = { cols: term.cols, rows: term.rows };
@@ -207,7 +213,7 @@ export function TerminalPane({
       term.dispose();
       termRef.current = null;
     };
-  }, [id, isPreview]);
+  }, [agentId, cmd, cwd, id, isPreview, sessionScope]);
 
   if (isPreview) {
     return (

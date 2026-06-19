@@ -7,8 +7,10 @@ use std::path::Path;
 const SOCKET_PATH: &str = "/tmp/claude-fleet.sock";
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Envelope {
     from: Option<String>,
+    from_room: Option<String>,
     to: String,
     body: String,
 }
@@ -38,7 +40,12 @@ pub fn start(registry: PtyRegistry) {
 }
 
 fn handle_conn(stream: UnixStream, registry: PtyRegistry) {
-    let mut reader = BufReader::new(stream.try_clone().ok().unwrap_or_else(|| stream.try_clone().unwrap()));
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .ok()
+            .unwrap_or_else(|| stream.try_clone().unwrap()),
+    );
     let mut writer = stream;
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
@@ -61,17 +68,18 @@ fn handle_conn(stream: UnixStream, registry: PtyRegistry) {
 
     let sender = env.from.unwrap_or_else(|| "unknown".to_string());
     let body = format!("[from {}]: {}", sender, env.body);
-    if let Err(e) = registry.write(&env.to, body.as_bytes()) {
+    if let Err(e) = registry.write_to_agent(env.from_room.as_deref(), &env.to, body.as_bytes()) {
         let _ = writeln!(writer, "error: {}", e);
         return;
     }
     let _ = app_state::record_message(sender.clone(), env.to.clone(), env.body);
 
     let target = env.to.clone();
+    let target_room = env.from_room.clone();
     let reg_for_submit = registry.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(250));
-        let _ = reg_for_submit.write(&target, b"\r");
+        let _ = reg_for_submit.write_to_agent(target_room.as_deref(), &target, b"\r");
     });
 
     let _ = writeln!(writer, "ok");

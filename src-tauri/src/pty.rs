@@ -42,6 +42,23 @@ impl PtyRegistry {
         let bytes = buffer.lock().clone();
         Ok(bytes)
     }
+
+    pub fn write_to_agent(
+        &self,
+        room_id: Option<&str>,
+        id: &str,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let scoped_id = room_id
+            .filter(|room| !room.is_empty() && !id.contains(':'))
+            .map(|room| format!("{}:{}", room, id));
+        if let Some(scoped_id) = scoped_id.as_deref() {
+            if self.ptys.lock().contains_key(scoped_id) {
+                return self.write(scoped_id, data);
+            }
+        }
+        self.write(id, data)
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -60,6 +77,10 @@ struct PtyExitEvent {
 #[serde(rename_all = "camelCase")]
 pub struct SpawnArgs {
     pub id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub session_scope: Option<String>,
     pub cwd: Option<String>,
     pub cmd: String,
     pub args: Vec<String>,
@@ -141,7 +162,9 @@ fn link_or_copy_file(source: &Path, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::os::unix::fs::symlink(source, dest).or_else(|_| fs::copy(source, dest).map(|_| ())).map_err(|e| e.to_string())
+    std::os::unix::fs::symlink(source, dest)
+        .or_else(|_| fs::copy(source, dest).map(|_| ()))
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(not(unix))]
@@ -152,7 +175,9 @@ fn link_or_copy_file(source: &Path, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::copy(source, dest).map(|_| ()).map_err(|e| e.to_string())
+    fs::copy(source, dest)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn isolated_codex_home(agent_id: &str) -> Result<Option<PathBuf>, String> {
@@ -183,11 +208,26 @@ pub fn spawn_pty(
     registry: State<'_, PtyRegistry>,
     args: SpawnArgs,
 ) -> Result<(), String> {
-    let SpawnArgs { id, cwd, cmd, args: cmd_args, cols, rows } = args;
+    let SpawnArgs {
+        id,
+        agent_id,
+        session_scope,
+        cwd,
+        cmd,
+        args: cmd_args,
+        cols,
+        rows,
+    } = args;
+    let agent_env_id = agent_id.unwrap_or_else(|| id.clone());
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| e.to_string())?;
 
     let mut cmd_builder = CommandBuilder::new(&cmd);
@@ -208,15 +248,26 @@ pub fn spawn_pty(
     }
     cmd_builder.env("PATH", command_path(path_value.unwrap_or_default()));
     cmd_builder.env("TERM", "xterm-256color");
-    cmd_builder.env("FLEET_AGENT_ID", &id);
+    cmd_builder.env("FLEET_AGENT_ID", &agent_env_id);
+    if let Some(room_id) = session_scope
+        .as_deref()
+        .and_then(|scope| scope.split_once(':').map(|(room, _)| room))
+    {
+        cmd_builder.env("FLEET_ROOM_ID", room_id);
+    }
+    cmd_builder.env("FLEET_PTY_ID", &id);
     cmd_builder.env("FLEET_SOCKET", "/tmp/claude-fleet.sock");
     if cmd == "codex" {
-        if let Some(codex_home) = isolated_codex_home(&id)? {
+        let codex_scope = session_scope.as_deref().unwrap_or(&agent_env_id);
+        if let Some(codex_home) = isolated_codex_home(codex_scope)? {
             cmd_builder.env("CODEX_HOME", codex_home.to_string_lossy().to_string());
         }
     }
 
-    let child = pair.slave.spawn_command(cmd_builder).map_err(|e| e.to_string())?;
+    let child = pair
+        .slave
+        .spawn_command(cmd_builder)
+        .map_err(|e| e.to_string())?;
     drop(pair.slave);
 
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
@@ -263,7 +314,10 @@ pub fn spawn_pty(
         }
         let _ = app_for_thread.emit(
             &format!("pty:exit:{}", id_for_thread),
-            PtyExitEvent { id: id_for_thread.clone(), code: None },
+            PtyExitEvent {
+                id: id_for_thread.clone(),
+                code: None,
+            },
         );
     });
 
@@ -271,10 +325,7 @@ pub fn spawn_pty(
 }
 
 #[tauri::command]
-pub fn read_pty_buffer(
-    registry: State<'_, PtyRegistry>,
-    id: String,
-) -> Result<Vec<u8>, String> {
+pub fn read_pty_buffer(registry: State<'_, PtyRegistry>, id: String) -> Result<Vec<u8>, String> {
     registry.read_buffer(&id)
 }
 
@@ -295,11 +346,18 @@ pub fn resize_pty(
     rows: u16,
 ) -> Result<(), String> {
     let map = registry.ptys.lock();
-    let handle = map.get(&id).ok_or_else(|| format!("pty {} not found", id))?;
+    let handle = map
+        .get(&id)
+        .ok_or_else(|| format!("pty {} not found", id))?;
     handle
         .master
         .lock()
-        .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| e.to_string())?;
     Ok(())
 }

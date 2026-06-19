@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { TerminalPane } from "./components/TerminalPane";
 import { AgentRuntime, runtimeAdapters } from "./runtimeAdapters";
 import "./App.css";
@@ -44,6 +45,30 @@ type MessageRecord = {
   createdAt: string;
 };
 
+type ClaudeTranscriptMessage = {
+  id: string;
+  role: string;
+  body: string;
+  createdAt: string | null;
+};
+
+type ClaudeTranscript = {
+  sessionId: string | null;
+  sessionPath: string | null;
+  updatedAt: string | null;
+  messages: ClaudeTranscriptMessage[];
+};
+
+type ClaudeTranscriptEvent = {
+  agentId: string;
+  transcript: ClaudeTranscript;
+};
+
+type ClaudeTranscriptErrorEvent = {
+  agentId: string;
+  error: string;
+};
+
 type LegacyTaskRecord = {
   id: string;
   title: string;
@@ -55,8 +80,25 @@ type LegacyTaskRecord = {
   updatedAt: string;
 };
 
+type RoomRecord = {
+  id: string;
+  workspace: ProjectWorkspace;
+  mainAgentId: string | null;
+  agents: AgentRecord[];
+  tasks: LegacyTaskRecord[];
+  orchestratorChat: unknown[];
+  messages: MessageRecord[];
+  runs: unknown[];
+  workspaces: unknown[];
+  selectedAgentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type FleetState = {
   schemaVersion: number;
+  activeRoomId: string | null;
+  rooms: RoomRecord[];
   activeWorkspace: ProjectWorkspace | null;
   mainAgentId: string | null;
   agents: AgentRecord[];
@@ -86,8 +128,15 @@ const agentColors = [
 
 const encode = (data: string) => Array.from(new TextEncoder().encode(data));
 const defaultAgentColor = (index: number) => agentColors[index % agentColors.length];
-const sessionMarker = (agentId: string) => `agent-home-v1:${agentId}:${Date.now()}`;
 const hasTauriBridge = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const scopedAgentId = (roomId: string | null | undefined, agentId: string) =>
+  roomId ? `${roomId}:${agentId}` : agentId;
+const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const createSessionId = () =>
+  globalThis.crypto?.randomUUID?.() ??
+  "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (char) =>
+    (Number(char) ^ (Math.random() * 16) >> (Number(char) / 4)).toString(16),
+  );
 
 const nextId = (prefix: string, existingIds: string[]) => {
   let n = existingIds.length + 1;
@@ -115,13 +164,20 @@ const formatTime = (value: string) => {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
+const toolEventName = (body: string) => {
+  const match = body.trim().match(/^\[tool:\s*([^\]]+)\]$/);
+  return match?.[1] ?? null;
+};
+
 const sameFleetState = (a: FleetState | null, b: FleetState) => {
   if (!a) return false;
   return JSON.stringify(a) === JSON.stringify(b);
 };
 
 const previewFleetState = (): FleetState => ({
-  schemaVersion: 3,
+  schemaVersion: 4,
+  activeRoomId: "preview-room",
+  rooms: [],
   activeWorkspace: {
     id: "preview-room",
     name: "microservices",
@@ -219,7 +275,29 @@ async function appInvoke<T>(cmd: string, args?: Record<string, unknown>): Promis
         body: String(args?.body ?? ""),
         createdAt: new Date().toISOString(),
       } as T;
+    case "read_claude_transcript":
+      return {
+        sessionId: "preview-session",
+        sessionPath: "~/.claude/projects/preview/preview-session.jsonl",
+        updatedAt: new Date().toISOString(),
+        messages: [
+          {
+            id: "preview-user",
+            role: "user",
+            body: "Does auth guarantee ordering for account events?",
+            createdAt: new Date(Date.now() - 1000 * 60 * 3).toISOString(),
+          },
+          {
+            id: "preview-assistant",
+            role: "assistant",
+            body: "Auth preserves order per account_id inside one partition. Cross-account events can arrive independently, so consumers should not infer global ordering.",
+            createdAt: new Date(Date.now() - 1000 * 60 * 2).toISOString(),
+          },
+        ],
+      } as T;
     case "write_pty":
+    case "watch_claude_transcript":
+    case "stop_claude_transcript_watch":
     case "plugin:dialog|open":
       return null as T;
     default:
@@ -228,9 +306,7 @@ async function appInvoke<T>(cmd: string, args?: Record<string, unknown>): Promis
 }
 
 const hasUsableSession = (agent: AgentRecord) => {
-  if (!agent.sessionId) return false;
-  if (agent.runtime === "codex") return agent.sessionId.startsWith("agent-home-v1:");
-  return true;
+  return Boolean(agent.sessionId && agent.status === "session-started");
 };
 
 const systemPromptFor = (agent: AgentRecord, agents: AgentRecord[]) => {
@@ -297,7 +373,7 @@ function createAgent({
     runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
     permissions: { canCreateAgents: false, canManageTasks: false },
     sourceTaskId: null,
-    sessionId: null,
+    sessionId: createSessionId(),
     status: "idle",
   };
 }
@@ -336,8 +412,12 @@ function App() {
         setMcpBinaryPath(binaryPath);
         setMailboxRoot(mailboxPath);
         setFleetState(state);
-        setSelectedAgentId(state.agents[0]?.id ?? null);
-        setManualRecipient(state.agents[0]?.id ?? "");
+        const initialAgentId =
+          state.rooms.find((room) => room.id === state.activeRoomId)?.selectedAgentId ??
+          state.agents[0]?.id ??
+          null;
+        setSelectedAgentId(initialAgentId);
+        setManualRecipient(initialAgentId ?? "");
         setNewAgentPath(state.activeWorkspace?.path ?? "");
       })
       .catch((error) => console.error("Failed to load fleet state:", error));
@@ -380,8 +460,8 @@ function App() {
     };
   }, [fleetState, mcpBinaryPath, mcpConfigPath]);
 
-  const saveState = (nextState: FleetState) => {
-    const normalized = normalizeLoadedState(nextState);
+  const saveState = (nextState: FleetState, selectedAgentOverride = selectedAgentId) => {
+    const normalized = persistActiveRoom(normalizeLoadedState(nextState), selectedAgentOverride);
     setFleetState(normalized);
     appInvoke("save_fleet_state", { state: normalized }).catch((error) =>
       console.error("Failed to save fleet state:", error),
@@ -389,6 +469,25 @@ function App() {
   };
 
   const activateWorkspace = (workspace: ProjectWorkspace) => {
+    if (fleetState) {
+      const currentState = persistActiveRoom(normalizeLoadedState(fleetState), selectedAgentId);
+      const existingRoom = currentState.rooms.find(
+        (room) => room.workspace.id === workspace.id || room.workspace.path === workspace.path,
+      );
+      if (existingRoom) {
+        const nextState = applyRoomToState(currentState, {
+          ...existingRoom,
+          workspace: { ...existingRoom.workspace, name: workspace.name || existingRoom.workspace.name },
+        });
+        const nextSelectedAgentId = existingRoom.selectedAgentId ?? nextState.mainAgentId ?? nextState.agents[0]?.id ?? null;
+        saveState(nextState, nextSelectedAgentId);
+        setSelectedAgentId(nextSelectedAgentId);
+        setManualRecipient(nextSelectedAgentId ?? "");
+        setNewAgentPath(nextState.activeWorkspace?.path ?? "");
+        return;
+      }
+    }
+
     const firstAgent = createAgent({
       id: "agent-1",
       label: workspace.name,
@@ -398,7 +497,9 @@ function App() {
       index: 0,
     });
     const nextState: FleetState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
+      activeRoomId: workspace.id,
+      rooms: fleetState ? persistActiveRoom(normalizeLoadedState(fleetState), selectedAgentId).rooms : [],
       activeWorkspace: workspace,
       mainAgentId: firstAgent.id,
       agents: [firstAgent],
@@ -408,10 +509,48 @@ function App() {
       runs: [],
       workspaces: [],
     };
-    saveState(nextState);
+    saveState(nextState, firstAgent.id);
     setSelectedAgentId(firstAgent.id);
     setManualRecipient(firstAgent.id);
     setNewAgentPath(workspace.path);
+  };
+
+  const switchRoom = (roomId: string) => {
+    if (!fleetState) return;
+    const currentState = persistActiveRoom(normalizeLoadedState(fleetState), selectedAgentId);
+    const room = currentState.rooms.find((item) => item.id === roomId);
+    if (!room) return;
+    const nextState = applyRoomToState(currentState, room);
+    const nextSelectedAgentId = room.selectedAgentId ?? nextState.mainAgentId ?? nextState.agents[0]?.id ?? null;
+    saveState(nextState, nextSelectedAgentId);
+    setSelectedAgentId(nextSelectedAgentId);
+    setManualRecipient(nextSelectedAgentId ?? "");
+    setNewAgentPath(nextState.activeWorkspace?.path ?? "");
+    setIsFocusMode(false);
+    setIsEditAgentOpen(false);
+  };
+
+  const startNewRoom = () => {
+    if (!fleetState) return;
+    const currentState = persistActiveRoom(normalizeLoadedState(fleetState), selectedAgentId);
+    const nextState = normalizeLoadedState({
+      ...currentState,
+      activeRoomId: null,
+      activeWorkspace: null,
+      mainAgentId: null,
+      agents: [],
+      tasks: [],
+      orchestratorChat: [],
+      messages: [],
+      runs: [],
+      workspaces: [],
+    });
+    saveState(nextState);
+    setSelectedAgentId(null);
+    setManualRecipient("");
+    setSetupPath("");
+    setSetupName("");
+    setIsFocusMode(false);
   };
 
   const openWorkspace = async () => {
@@ -475,7 +614,7 @@ function App() {
 
   const resetRoom = () => {
     if (!fleetState) return;
-    saveState({ ...fleetState, activeWorkspace: null });
+    startNewRoom();
   };
 
   const addAgent = () => {
@@ -524,13 +663,15 @@ function App() {
     setFleetState((current) => {
       if (!current) return current;
       const existing = current.agents.find((agent) => agent.id === id);
-      if (!existing || existing.sessionId) return current;
-      const normalized = normalizeLoadedState({
+      if (!existing || existing.status === "session-started") return current;
+      const normalized = persistActiveRoom(normalizeLoadedState({
         ...current,
         agents: current.agents.map((agent) =>
-          agent.id === id ? { ...agent, sessionId: sessionMarker(id) } : agent,
+          agent.id === id
+            ? { ...agent, sessionId: agent.sessionId ?? createSessionId(), status: "session-started" }
+            : agent,
         ),
-      });
+      }), selectedAgentId);
       appInvoke("save_fleet_state", { state: normalized }).catch((error) =>
         console.error("Failed to save agent session marker:", error),
       );
@@ -545,9 +686,10 @@ function App() {
     setIsSendingMessage(true);
     try {
       const body = `[from human]: ${trimmedMessage}`;
-      await appInvoke("write_pty", { id: manualRecipient, data: encode(body) });
+      const targetPtyId = scopedAgentId(fleetState?.activeRoomId ?? fleetState?.activeWorkspace?.id, manualRecipient);
+      await appInvoke("write_pty", { id: targetPtyId, data: encode(body) });
       window.setTimeout(() => {
-        appInvoke("write_pty", { id: manualRecipient, data: encode("\r") }).catch((error) =>
+        appInvoke("write_pty", { id: targetPtyId, data: encode("\r") }).catch((error) =>
           console.error("Failed to submit manual message:", error),
         );
       }, 250);
@@ -587,6 +729,14 @@ function App() {
   if (!fleetState.activeWorkspace) {
     return (
       <WorkspaceSetup
+        tabs={
+          <RoomTabs
+            rooms={fleetState.rooms}
+            activeRoomId={fleetState.activeRoomId}
+            onSelectRoom={switchRoom}
+            onNewRoom={startNewRoom}
+          />
+        }
         path={setupPath}
         name={setupName}
         error={setupError}
@@ -601,6 +751,12 @@ function App() {
 
   return (
     <main className={`app-shell room-shell ${isFocusMode ? "is-focus-mode" : ""}`}>
+      <RoomTabs
+        rooms={fleetState.rooms}
+        activeRoomId={fleetState.activeRoomId}
+        onSelectRoom={switchRoom}
+        onNewRoom={startNewRoom}
+      />
       <section className="room-workbench">
         <header className="workbench-bar">
           <div>
@@ -623,7 +779,8 @@ function App() {
             <div className={`agent-grid ${isFocusMode ? "is-focused" : ""}`}>
               {fleetState.agents.map((agent) => (
                 <ProjectAgentPane
-                  key={agent.id}
+                  key={`${fleetState.activeRoomId ?? "room"}:${agent.id}`}
+                  roomId={fleetState.activeRoomId ?? fleetState.activeWorkspace?.id ?? "room"}
                   agent={agent}
                   selected={agent.id === selectedAgent?.id}
                   focused={isFocusMode && agent.id === selectedAgent?.id}
@@ -753,9 +910,8 @@ function App() {
   );
 }
 
-function normalizeLoadedState(state: FleetState): FleetState {
-  const workspacePath = state.activeWorkspace?.path ?? null;
-  const agents = state.agents.map((agent, index) => {
+function normalizeAgents(agents: AgentRecord[], workspacePath: string | null): AgentRecord[] {
+  return agents.map((agent, index) => {
     const isLegacyOrchestrator = agent.id === "orchestrator" || agent.role === "orchestrator";
     return {
       ...agent,
@@ -776,17 +932,118 @@ function normalizeLoadedState(state: FleetState): FleetState {
       runtimeConfig: agent.runtimeConfig ?? { heartbeat: { enabled: false, wakeOnDemand: true } },
       permissions: { canCreateAgents: false, canManageTasks: false },
       sourceTaskId: null,
-      sessionId:
-        agent.runtime === "codex" && agent.sessionId && !agent.sessionId.startsWith("agent-home-v1:")
-          ? null
-          : agent.sessionId ?? null,
-      status: agent.status || "idle",
+      sessionId: agent.sessionId && sessionIdPattern.test(agent.sessionId) ? agent.sessionId : createSessionId(),
+      status: agent.sessionId && sessionIdPattern.test(agent.sessionId) ? agent.status || "idle" : "idle",
     };
   });
+}
+
+function normalizeRoom(room: RoomRecord): RoomRecord {
+  const agents = normalizeAgents(room.agents ?? [], room.workspace.path);
+  return {
+    ...room,
+    id: room.id || room.workspace.id,
+    workspace: room.workspace,
+    mainAgentId:
+      room.mainAgentId && agents.some((agent) => agent.id === room.mainAgentId)
+        ? room.mainAgentId
+        : agents[0]?.id ?? null,
+    agents,
+    tasks: [],
+    orchestratorChat: [],
+    messages: room.messages ?? [],
+    runs: [],
+    workspaces: room.workspaces ?? [],
+    selectedAgentId:
+      room.selectedAgentId && agents.some((agent) => agent.id === room.selectedAgentId)
+        ? room.selectedAgentId
+        : agents[0]?.id ?? null,
+    createdAt: room.createdAt ?? room.workspace.createdAt,
+    updatedAt: room.updatedAt ?? room.workspace.createdAt,
+  };
+}
+
+function snapshotActiveRoom(
+  state: FleetState,
+  selectedAgentId?: string | null,
+  updatedAt?: string,
+): RoomRecord | null {
+  if (!state.activeWorkspace) return null;
+  return normalizeRoom({
+    id: state.activeRoomId ?? state.activeWorkspace.id,
+    workspace: state.activeWorkspace,
+    mainAgentId: state.mainAgentId,
+    agents: state.agents,
+    tasks: state.tasks,
+    orchestratorChat: state.orchestratorChat,
+    messages: state.messages,
+    runs: state.runs,
+    workspaces: state.workspaces,
+    selectedAgentId: selectedAgentId ?? state.mainAgentId ?? state.agents[0]?.id ?? null,
+    createdAt: state.activeWorkspace.createdAt,
+    updatedAt: updatedAt ?? state.activeWorkspace.createdAt,
+  });
+}
+
+function upsertRoom(rooms: RoomRecord[], room: RoomRecord): RoomRecord[] {
+  const nextRooms = rooms.filter((item) => item.id !== room.id);
+  return [room, ...nextRooms];
+}
+
+function persistActiveRoom(state: FleetState, selectedAgentId?: string | null): FleetState {
+  const snapshot = snapshotActiveRoom(state, selectedAgentId, new Date().toISOString());
+  if (!snapshot) return state;
+  return {
+    ...state,
+    activeRoomId: snapshot.id,
+    rooms: upsertRoom(state.rooms ?? [], snapshot),
+  };
+}
+
+function applyRoomToState(state: FleetState, room: RoomRecord): FleetState {
+  const normalizedRoom = normalizeRoom(room);
+  return normalizeLoadedState({
+    ...state,
+    activeRoomId: normalizedRoom.id,
+    activeWorkspace: normalizedRoom.workspace,
+    mainAgentId: normalizedRoom.mainAgentId,
+    agents: normalizedRoom.agents,
+    tasks: normalizedRoom.tasks,
+    orchestratorChat: normalizedRoom.orchestratorChat,
+    messages: normalizedRoom.messages,
+    runs: normalizedRoom.runs,
+    workspaces: normalizedRoom.workspaces,
+    rooms: upsertRoom(state.rooms ?? [], normalizedRoom),
+  });
+}
+
+function normalizeLoadedState(state: FleetState): FleetState {
+  const workspacePath = state.activeWorkspace?.path ?? null;
+  const agents = normalizeAgents(state.agents ?? [], workspacePath);
+  const savedRooms = (state.rooms ?? []).map(normalizeRoom);
+  const activeRoomId = state.activeRoomId ?? state.activeWorkspace?.id ?? savedRooms[0]?.id ?? null;
+  const activeSelectedAgentId = savedRooms.find((room) => room.id === activeRoomId)?.selectedAgentId ?? state.mainAgentId;
+  const activeSnapshot = snapshotActiveRoom(
+    {
+      ...state,
+      activeRoomId,
+      agents,
+      tasks: [],
+      orchestratorChat: [],
+      messages: state.messages ?? [],
+      runs: [],
+      workspaces: state.workspaces ?? [],
+      rooms: savedRooms,
+    },
+    activeSelectedAgentId,
+  );
+  const rooms = activeSnapshot ? upsertRoom(savedRooms, activeSnapshot) : savedRooms;
 
   return {
     ...state,
-    schemaVersion: 3,
+    schemaVersion: 4,
+    activeRoomId,
+    rooms,
     mainAgentId:
       state.mainAgentId && agents.some((agent) => agent.id === state.mainAgentId)
         ? state.mainAgentId
@@ -800,7 +1057,48 @@ function normalizeLoadedState(state: FleetState): FleetState {
   };
 }
 
+function RoomTabs({
+  rooms,
+  activeRoomId,
+  onSelectRoom,
+  onNewRoom,
+}: {
+  rooms: RoomRecord[];
+  activeRoomId: string | null;
+  onSelectRoom: (id: string) => void;
+  onNewRoom: () => void;
+}) {
+  return (
+    <nav className="room-tabs" aria-label="Rooms">
+      <div className="room-tab-strip">
+        {rooms.map((room) => (
+          <button
+            className={`room-tab ${room.id === activeRoomId ? "is-active" : ""}`}
+            key={room.id}
+            onClick={() => onSelectRoom(room.id)}
+            title={room.workspace.path}
+            type="button"
+          >
+            <span>{room.workspace.name}</span>
+            <small>{room.agents.length}</small>
+          </button>
+        ))}
+        <button
+          aria-label="New room"
+          className="room-tab add-room-tab"
+          onClick={onNewRoom}
+          type="button"
+          title="New room"
+        >
+          +
+        </button>
+      </div>
+    </nav>
+  );
+}
+
 function ProjectAgentPane({
+  roomId,
   agent,
   selected,
   focused,
@@ -811,6 +1109,7 @@ function ProjectAgentPane({
   onFocus,
   onSessionStarted,
 }: {
+  roomId: string;
   agent: AgentRecord;
   selected: boolean;
   focused: boolean;
@@ -823,7 +1122,10 @@ function ProjectAgentPane({
 }) {
   const paneRef = useRef<HTMLElement | null>(null);
   const [terminalReady, setTerminalReady] = useState(selected || focused);
+  const [paneView, setPaneView] = useState<"chat" | "terminal">("chat");
   const adapter = runtimeAdapters[agent.runtime];
+  const sessionScope = `${roomId}:${agent.id}`;
+  const ptyId = scopedAgentId(roomId, agent.id);
   const context = {
     ...runtimeContext,
     systemPrompt: () => systemPromptFor(agent, allAgents),
@@ -868,30 +1170,276 @@ function ProjectAgentPane({
         </button>
         <div className="agent-pane-actions">
           <code>{agent.runtime}</code>
+          <div className="pane-mode-toggle" aria-label={`${agent.label} view`}>
+            <button
+              className={paneView === "chat" ? "is-active" : ""}
+              onClick={() => setPaneView("chat")}
+              type="button"
+            >
+              Chat
+            </button>
+            <button
+              className={paneView === "terminal" ? "is-active" : ""}
+              onClick={() => setPaneView("terminal")}
+              type="button"
+            >
+              Terminal
+            </button>
+          </div>
           <button className="btn" onClick={() => onFocus(agent.id)}>
             {focused ? "Exit focus" : "Focus"}
           </button>
         </div>
       </div>
       <div className="agent-project-path" title={agent.cwd ?? undefined}>{shortPath(agent.cwd)}</div>
-      <div className="agent-terminal-slot">
-        {terminalReady ? (
-          <TerminalPane
-            id={agent.id}
-            cmd={adapter.command}
-            args={adapter.freshArgs(agent.id, context)}
-            continueArgs={adapter.resumeArgs(agent.id, context)}
-            initialUseContinue={shouldResume}
-            onSessionStarted={() => onSessionStarted(agent.id)}
-            cwd={agent.cwd ?? undefined}
-          />
-        ) : (
-          <div className="terminal-standby" aria-label={`${agent.label} terminal standby`}>
-            <span>standby</span>
-          </div>
-        )}
+      <div className="agent-live-slot">
+        <div className={`pane-layer ${paneView === "terminal" ? "is-active" : ""}`} aria-hidden={paneView !== "terminal"}>
+          {terminalReady ? (
+            <TerminalPane
+              id={ptyId}
+              agentId={agent.id}
+              sessionScope={sessionScope}
+              cmd={adapter.command}
+              args={adapter.freshArgs(agent.id, context, agent.sessionId)}
+              continueArgs={adapter.resumeArgs(agent.id, context, agent.sessionId)}
+              initialUseContinue={shouldResume}
+              onSessionStarted={() => onSessionStarted(agent.id)}
+              cwd={agent.cwd ?? undefined}
+            />
+          ) : (
+            <div className="terminal-standby" aria-label={`${agent.label} terminal standby`}>
+              <span>standby</span>
+            </div>
+          )}
+        </div>
+        <div className={`pane-layer ${paneView === "chat" ? "is-active" : ""}`} aria-hidden={paneView !== "chat"}>
+          <AgentTranscriptChat roomId={roomId} agent={agent} active={paneView === "chat"} />
+        </div>
       </div>
     </article>
+  );
+}
+
+function AgentTranscriptChat({ roomId, agent, active }: { roomId: string; agent: AgentRecord; active: boolean }) {
+  const [transcript, setTranscript] = useState<ClaudeTranscript | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const isClaude = agent.runtime === "claude";
+  const transcriptKey = `${roomId}:${agent.id}`;
+
+  useEffect(() => {
+    if (!active || !agent.cwd || !isClaude) return;
+    let cancelled = false;
+    let unlistenTranscript: UnlistenFn | undefined;
+    let unlistenError: UnlistenFn | undefined;
+
+    appInvoke<ClaudeTranscript>("read_claude_transcript", {
+      agentId: transcriptKey,
+      cwd: agent.cwd,
+      limit: 80,
+      sessionId: agent.sessionId,
+    })
+      .then((nextTranscript) => {
+        if (cancelled) return;
+        setTranscript(nextTranscript);
+        setError(null);
+      })
+      .catch((loadError) => {
+        if (cancelled) return;
+        setError(String(loadError));
+      });
+
+    if (hasTauriBridge()) {
+      listen<ClaudeTranscriptEvent>(`claude:transcript:${transcriptKey}`, (event) => {
+        if (cancelled) return;
+        setTranscript(event.payload.transcript);
+        setError(null);
+      }).then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenTranscript = unlisten;
+      });
+
+      listen<ClaudeTranscriptErrorEvent>(`claude:transcript-error:${transcriptKey}`, (event) => {
+        if (cancelled) return;
+        setError(event.payload.error);
+      }).then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenError = unlisten;
+      });
+
+      appInvoke("watch_claude_transcript", {
+        agentId: transcriptKey,
+        cwd: agent.cwd,
+        limit: 80,
+        sessionId: agent.sessionId,
+      }).catch((watchError) => {
+        if (!cancelled) setError(String(watchError));
+      });
+    }
+
+    return () => {
+      cancelled = true;
+      unlistenTranscript?.();
+      unlistenError?.();
+      if (hasTauriBridge()) {
+        appInvoke("stop_claude_transcript_watch", { agentId: transcriptKey }).catch(() => {});
+      }
+    };
+  }, [active, agent.cwd, agent.sessionId, isClaude, transcriptKey]);
+
+  useEffect(() => {
+    if (!active) return;
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    scroller.scrollTop = scroller.scrollHeight;
+  }, [active, transcript?.messages.length]);
+
+  if (!agent.cwd) {
+    return (
+      <div className="chat-empty-state">
+        <strong>No project path</strong>
+        <span>Add a project path to read this agent's Claude session as chat.</span>
+      </div>
+    );
+  }
+
+  if (!isClaude) {
+    return (
+      <div className="chat-empty-state">
+        <strong>Chat transcript unavailable</strong>
+        <span>Codex panes still run in terminal mode. Claude JSONL chat is available for Claude agents.</span>
+      </div>
+    );
+  }
+
+  const messages = transcript?.messages ?? [];
+
+  return (
+    <section className="agent-chat" aria-label={`${agent.label} Claude transcript`}>
+      <header className="agent-chat-header">
+        <div>
+          <strong>Chat</strong>
+          <span title={transcript?.sessionPath ?? undefined}>
+            {transcript?.sessionId ? `session ${transcript.sessionId.slice(0, 8)}` : "waiting for Claude session"}
+          </span>
+        </div>
+        <code>{messages.length}</code>
+      </header>
+
+      <div ref={scrollerRef} className="chat-scroll">
+        {messages.map((message) => {
+          const toolName = toolEventName(message.body);
+          if (toolName) {
+            return (
+              <div className="chat-event" key={message.id}>
+                <span>tool</span>
+                <code>{toolName}</code>
+                {message.createdAt ? <time>{formatTime(message.createdAt)}</time> : null}
+              </div>
+            );
+          }
+
+          return (
+            <article className={`chat-message is-${message.role}`} key={message.id}>
+              <div className="chat-message-meta">
+                <span>{message.role === "assistant" ? agent.label : "you"}</span>
+                {message.createdAt ? <time>{formatTime(message.createdAt)}</time> : null}
+              </div>
+              <ChatMessageBody body={message.body} />
+            </article>
+          );
+        })}
+        {messages.length === 0 && !error ? (
+          <div className="chat-empty-state">
+            <strong>No transcript yet</strong>
+            <span>Claude will appear here after this project has an active session in ~/.claude/projects.</span>
+          </div>
+        ) : null}
+        {error ? (
+          <div className="chat-empty-state is-error">
+            <strong>Could not read transcript</strong>
+            <span>{error}</span>
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function renderInlineMarkdown(text: string) {
+  const nodes: React.ReactNode[] = [];
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+
+    const token = match[0];
+    if (token.startsWith("`")) {
+      nodes.push(<code key={`${match.index}-code`}>{token.slice(1, -1)}</code>);
+    } else {
+      nodes.push(<strong key={`${match.index}-strong`}>{token.slice(2, -2)}</strong>);
+    }
+    lastIndex = match.index + token.length;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+
+  return nodes;
+}
+
+function ChatMessageBody({ body }: { body: string }) {
+  const segments = body.split(/(```[\s\S]*?```)/g).filter(Boolean);
+
+  return (
+    <div className="chat-message-body">
+      {segments.map((segment, segmentIndex) => {
+        if (segment.startsWith("```") && segment.endsWith("```")) {
+          const code = segment.replace(/^```[^\n]*\n?/, "").replace(/```$/, "").trimEnd();
+          return <pre key={segmentIndex}><code>{code}</code></pre>;
+        }
+
+        return segment
+          .split(/\n{2,}/)
+          .map((block, blockIndex) => {
+            const lines = block.split("\n").map((line) => line.trimEnd()).filter(Boolean);
+            if (lines.length === 0) return null;
+
+            const everyLineIsBullet = lines.every((line) => /^[-*]\s+/.test(line.trim()));
+            if (everyLineIsBullet) {
+              return (
+                <ul key={`${segmentIndex}-${blockIndex}`}>
+                  {lines.map((line, lineIndex) => (
+                    <li key={lineIndex}>{renderInlineMarkdown(line.trim().replace(/^[-*]\s+/, ""))}</li>
+                  ))}
+                </ul>
+              );
+            }
+
+            return (
+              <p key={`${segmentIndex}-${blockIndex}`}>
+                {lines.map((line, lineIndex) => (
+                  <React.Fragment key={lineIndex}>
+                    {lineIndex > 0 ? <br /> : null}
+                    {renderInlineMarkdown(line.trim())}
+                  </React.Fragment>
+                ))}
+              </p>
+            );
+          });
+      })}
+    </div>
   );
 }
 
@@ -1169,6 +1717,7 @@ function AddAgentModal({
 }
 
 function WorkspaceSetup({
+  tabs,
   path,
   name,
   error,
@@ -1178,6 +1727,7 @@ function WorkspaceSetup({
   onCreate,
   onBrowse,
 }: {
+  tabs?: React.ReactNode;
   path: string;
   name: string;
   error: string | null;
@@ -1189,6 +1739,7 @@ function WorkspaceSetup({
 }) {
   return (
     <main className="setup-shell">
+      {tabs}
       <section className="setup-brand">
         <div className="eyebrow">Context federation</div>
         <h1>claude-fleet</h1>
